@@ -3,20 +3,19 @@
 import pandas as pd
 from sklearn.preprocessing import StandardScaler # Keep scaler if needed for other steps
 import numpy as np
-import mt5 as mt5 # Import for MT5 constants if needed later
-import time
+# import mt5 as mt5 # No longer needed here if loading is centralized
 
 class DataPreprocessor:
     """
-    Handles loading (primarily from MT5 via main script now), cleaning,
-    and basic preprocessing of market data before feature engineering.
+    Handles cleaning and basic preprocessing of market data
+    *after* it has been loaded (e.g., from MT5 in main.py).
     """
     def __init__(self, config=None):
         """
         Initializes the DataPreprocessor.
 
         Args:
-            config (dict, optional): Configuration dictionary.
+            config (dict, optional): Configuration dictionary (currently unused).
         """
         self.config = config or {}
         # Scaler might be used if specific pre-feature-extraction scaling is needed,
@@ -24,67 +23,16 @@ class DataPreprocessor:
         self.scaler = None
         print("DataPreprocessor initialized.")
 
-    def load_data_from_mt5(self, symbol, timeframe_str, num_bars):
-        """
-        Loads historical data directly from MetaTrader 5 terminal.
-        (Note: This logic is duplicated in main.py, consider centralizing later if needed)
-
-        Args:
-            symbol (str): The trading symbol.
-            timeframe_str (str): Timeframe string (e.g., 'M1', 'H1').
-            num_bars (int): Number of bars to download.
-
-        Returns:
-            pd.DataFrame or None: Loaded data or None on failure.
-        """
-        timeframe_map = {
-            'M1': mt5.TIMEFRAME_M1, 'M5': mt5.TIMEFRAME_M5, 'M15': mt5.TIMEFRAME_M15,
-            'M30': mt5.TIMEFRAME_M30, 'H1': mt5.TIMEFRAME_H1, 'H4': mt5.TIMEFRAME_H4,
-            'D1': mt5.TIMEFRAME_D1, 'W1': mt5.TIMEFRAME_W1, 'MN1': mt5.TIMEFRAME_MN1
-        }
-        timeframe = timeframe_map.get(timeframe_str.upper())
-        if timeframe is None:
-            print(f"Error: Invalid timeframe '{timeframe_str}'.")
-            return None
-
-        print(f"DataPreprocessor: Attempting to load {num_bars} bars of {symbol} {timeframe_str} data from MT5...")
-
-        if not mt5.terminal_info():
-            print("Error: MT5 terminal not initialized.")
-            # Initialization should happen in main.py before calling this
-            return None
-
-        symbol_info = mt5.symbol_info(symbol)
-        if symbol_info is None:
-            print(f"Symbol {symbol} not found in MetaTrader 5.")
-            return None
-        if not symbol_info.visible:
-            print(f"Symbol {symbol} is not visible, enabling...")
-            if not mt5.symbol_select(symbol, True):
-                print(f"mt5.symbol_select failed, error = {mt5.last_error()}")
-                return None
-            time.sleep(1)
-
-        rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, num_bars)
-        if rates is None or len(rates) == 0:
-            print(f"No data received from MT5 for {symbol} {timeframe_str}. Error: {mt5.last_error()}")
-            return None
-
-        data = pd.DataFrame(rates)
-        data['time'] = pd.to_datetime(data['time'], unit='s')
-        data = data.set_index('time')
-        data.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'tick_volume': 'volume'}, inplace=True)
-        data = data[['open', 'high', 'low', 'close', 'volume']]
-        print(f"DataPreprocessor: Loaded {len(data)} bars for {symbol}.")
-        return data
-
+    # Removed load_data_from_mt5 as it's redundant with main.py's loading
 
     def clean_data(self, data, symbol=""):
         """
         Performs basic data cleaning on the input DataFrame.
+        Assumes data has already been loaded.
 
         Args:
-            data (pd.DataFrame): Input DataFrame (assumed to have OHLCV columns).
+            data (pd.DataFrame): Input DataFrame (assumed to have OHLCV columns
+                                 and potentially a datetime index).
             symbol (str, optional): Symbol name for logging purposes.
 
         Returns:
@@ -95,51 +43,54 @@ class DataPreprocessor:
             return pd.DataFrame()
 
         print(f"Cleaning data for {symbol} ({len(data)} rows)...")
+        df = data.copy() # Work on a copy
+
+        # Ensure required columns exist (case-insensitive)
         required_cols = ['open', 'high', 'low', 'close', 'volume']
-        missing_cols = [col for col in required_cols if col not in data.columns]
+        df.columns = df.columns.str.lower() # Standardize to lower case
+        missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
             raise ValueError(f"Data for {symbol} is missing required columns: {missing_cols}")
 
-        # Handle NaNs
-        initial_nans = data.isnull().sum().sum()
-        data = data.ffill() # Forward fill first
-        data = data.bfill() # Backward fill remaining NaNs at the start
-        final_nans = data.isnull().sum().sum()
+        # Ensure data types are numeric
+        for col in required_cols:
+             df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # Handle NaNs introduced by coercion or already present
+        initial_nans = df.isnull().sum().sum()
+        df = df.ffill() # Forward fill first
+        df = df.bfill() # Backward fill remaining NaNs at the start
+        final_nans = df.isnull().sum().sum()
         if initial_nans > 0:
             print(f"NaNs handled for {symbol}: {initial_nans} -> {final_nans}")
 
+        # Remove rows where essential price data might still be NaN (shouldn't happen after ffill/bfill)
+        df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
+
         # Remove duplicate timestamps (if index is datetime)
-        if isinstance(data.index, pd.DatetimeIndex):
-            initial_len = len(data)
-            data = data[~data.index.duplicated(keep='first')]
-            if len(data) < initial_len:
-                print(f"Removed {initial_len - len(data)} duplicate timestamp entries for {symbol}.")
-        else:
-             print("Warning: Index is not DatetimeIndex, cannot check for duplicate timestamps.")
+        if isinstance(df.index, pd.DatetimeIndex):
+            initial_len = len(df)
+            df = df[~df.index.duplicated(keep='first')]
+            if len(df) < initial_len:
+                print(f"Removed {initial_len - len(df)} duplicate timestamp entries for {symbol}.")
+        # else:
+             # Optional: If index is not datetime, check for duplicate rows based on columns?
+             # print("Warning: Index is not DatetimeIndex, cannot check for duplicate timestamps.")
 
 
         # Optional: Add more cleaning steps like outlier filtering if needed
-        # Example: Filter out bars with zero range (H=L) or extreme volume spikes
+        # Example: Filter out bars with zero range (H=L) or zero volume
+        # zero_range_count = len(df[df['high'] == df['low']])
+        # zero_volume_count = len(df[df['volume'] == 0])
+        # if zero_range_count > 0: print(f"Found {zero_range_count} bars with zero range for {symbol}.")
+        # if zero_volume_count > 0: print(f"Found {zero_volume_count} bars with zero volume for {symbol}.")
+        # df = df[(df['high'] != df['low']) & (df['volume'] > 0)]
 
-        print(f"Data cleaning finished for {symbol}.")
-        return data
 
-    def preprocess_symbol_data(self, symbol, timeframe_str, num_bars):
-        """
-        Loads and cleans data for a specific symbol from MT5.
-        (This might be redundant if main.py handles loading/cleaning directly).
+        print(f"Data cleaning finished for {symbol}. Final shape: {df.shape}")
+        return df
 
-        Args:
-            symbol (str): The trading symbol.
-            timeframe_str (str): Timeframe string (e.g., 'M1', 'H1').
-            num_bars (int): Number of bars to download.
-
-        Returns:
-            pd.DataFrame: Preprocessed data ready for feature engineering.
-        """
-        data = self.load_data_from_mt5(symbol, timeframe_str, num_bars)
-        data = self.clean_data(data, symbol)
-        return data
+    # Removed preprocess_symbol_data as loading is now external
 
 # --- Factory Function ---
 def create_preprocessor(config=None):
@@ -149,30 +100,31 @@ def create_preprocessor(config=None):
     return DataPreprocessor(config=config)
 
 # Example Usage (can be removed)
-# Note: Requires MT5 connection initialized externally
 if __name__ == '__main__':
-    # Example: Initialize MT5 connection here for standalone testing
-    # (Replace with your actual details and path)
-    # if not mt5.initialize(login=123456, password="PASSWORD", server="SERVER", path="PATH_TO_MT5"):
-    #     print("MT5 initialization failed for example.")
-    # else:
-    #     print("MT5 Initialized for Preprocessor Example.")
-    #     try:
-    #         preprocessor = create_preprocessor()
-    #         # Test loading and cleaning
-    #         eurusd_data = preprocessor.preprocess_symbol_data('EURUSD', 'M1', 1000)
-    #         if eurusd_data is not None and not eurusd_data.empty:
-    #             print("\nProcessed EURUSD Data Head:")
-    #             print(eurusd_data.head())
-    #             print("\nProcessed EURUSD Data Info:")
-    #             eurusd_data.info()
-    #         else:
-    #              print("Failed to process EURUSD data.")
+    # Create dummy data for testing cleaning
+    dates = pd.date_range(start='2023-01-01', periods=10, freq='h')
+    dummy_data = pd.DataFrame({
+        'open': [1.0, 1.1, 1.1, 1.2, np.nan, 1.3, 1.4, 1.4, 1.5, 1.6],
+        'high': [1.1, 1.2, 1.15, 1.3, 1.35, 1.4, 1.5, 1.45, 1.6, 1.7],
+        'low': [0.9, 1.0, 1.05, 1.1, 1.2, 1.25, 1.3, 1.4, 1.4, 1.5],
+        'close': [1.1, 1.15, 1.05, 1.25, 1.3, 1.35, 1.45, 1.42, 1.55, 1.65],
+        'volume': [100, 150, 120, 200, 180, 220, 250, 0, 300, 350]
+    }, index=dates)
+    # Add a duplicate index
+    dummy_data = pd.concat([dummy_data, dummy_data.iloc[-1:]])
+    # Add a NaN row start
+    nan_row = pd.DataFrame({c: [np.nan] for c in dummy_data.columns}, index=[dates[0]-pd.Timedelta(hours=1)])
+    dummy_data = pd.concat([nan_row, dummy_data])
 
-    #     except Exception as e:
-    #         print(f"\nError during example run: {e}")
-    #     finally:
-    #          if mt5.terminal_info(): mt5.shutdown() # Shutdown MT5 if initialized here
-    print("DataPreprocessor example finished (requires external MT5 init).")
 
+    print("--- Original Dummy Data ---")
+    print(dummy_data)
+
+    preprocessor = create_preprocessor()
+    cleaned_data = preprocessor.clean_data(dummy_data, symbol="DUMMY")
+
+    print("\n--- Cleaned Dummy Data ---")
+    print(cleaned_data)
+    print("\nInfo:")
+    cleaned_data.info()
 
