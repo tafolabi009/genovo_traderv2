@@ -111,8 +111,13 @@ def load_and_clean_data_for_symbols(config, symbols, logger):
 
     # Ensure MT5 is connected (should be called after initialize_mt5_connection)
     if not mt5.terminal_info() or not mt5.terminal_info().connected:
-         logger.error("MT5 not connected. Cannot load historical data.")
-         return {} # Return empty dict
+         # Allow connection attempt here if not connected
+         logger.warning("MT5 not connected. Attempting to initialize for data loading...")
+         if not initialize_mt5_connection(config, logger):
+              logger.error("MT5 connection failed. Cannot load historical data.")
+              return {}
+         logger.info("MT5 reconnected successfully for data loading.")
+
 
     # --- Log available symbols ---
     try:
@@ -176,24 +181,29 @@ def load_and_clean_data_for_symbols(config, symbols, logger):
     return all_data_cleaned
 
 
-def run_simulation_or_training(config, logger):
+def run_simulation_or_training(config, logger, keep_mt5_connected=False):
     """
     Runs the trading simulation/training independently for each configured symbol.
     Pre-calculates features for efficiency.
     Saves the fitted scaler state and model for each symbol after training.
+
+    Args:
+        config (dict): The configuration dictionary.
+        logger (logging.Logger): The logger instance.
+        keep_mt5_connected (bool): If True, does not shut down MT5 connection at the end.
     """
     logger.info("--- Starting Multi-Symbol Simulation/Training Mode ---")
     symbols_requested = config.get('symbols', [])
     if not symbols_requested:
         logger.error("No symbols specified in configuration ('symbols' list). Exiting.")
         send_email_notification("GenovoTraderV2 Error", "Startup failed: No symbols specified in config.", config)
-        return
+        return False # Indicate failure
 
     # Ensure MT5 connection for data loading
     if not initialize_mt5_connection(config, logger):
         logger.error("MT5 connection failed. Cannot proceed with simulation/training.")
         send_email_notification("GenovoTraderV2 Error", "Startup failed: Could not initialize MT5 for data loading.", config)
-        return
+        return False # Indicate failure
 
     try:
         # Load and clean data using the dedicated function
@@ -201,15 +211,15 @@ def run_simulation_or_training(config, logger):
         if not all_historical_data:
             logger.error("Failed to load data for any requested symbols. Exiting.")
             send_email_notification("GenovoTraderV2 Error", "Startup failed: Could not load/clean data for any requested symbols.", config)
-            return
+            return False # Indicate failure
     except Exception as e:
         logger.error(f"Critical error during multi-symbol data loading/cleaning: {e}", exc_info=True)
         error_details = f"Critical error during data loading/cleaning:\n{traceback.format_exc()}"
         send_email_notification("GenovoTraderV2 Error", f"Startup failed: {error_details}", config)
-        return
+        return False # Indicate failure
     finally:
-        # Shutdown MT5 if it's only needed for data loading in this mode
-        if config.get('mode', 'simulation') != 'live':
+        # Shutdown MT5 ONLY if we are NOT keeping it connected for live mode
+        if not keep_mt5_connected:
              if mt5.terminal_info(): mt5.shutdown(); logger.info("MT5 connection shut down after data loading.")
 
 
@@ -219,7 +229,6 @@ def run_simulation_or_training(config, logger):
 
     all_results = {}
     errors_occurred = False
-    # feature_pipelines = {} # No longer needed to store pipelines here
     all_features_scaled = {}
     all_feature_pipelines = {} # Store fitted pipelines to save scalers later
     logger.info("--- Pre-calculating Features for all symbols ---")
@@ -295,7 +304,7 @@ def run_simulation_or_training(config, logger):
 
 
         simulator = None # Define simulator outside try block
-        results = None # Initialize results to None *** FIX HERE ***
+        results = None # Initialize results to None
         try:
             # --- Create Simulator with Pre-calculated Features ---
             simulator = create_simulator(
@@ -417,6 +426,8 @@ def run_simulation_or_training(config, logger):
         email_body += "\n\nNOTE: Errors occurred during the process. Please check the logs."
     send_email_notification(email_subject, email_body, config)
     logger.info(f"--- Multi-Symbol {config.get('mode','Simulation').capitalize()} Finished ---")
+    # Return True if successful, False otherwise (or if errors occurred)
+    return not errors_occurred
 
 
 def run_live(config, logger):
@@ -426,7 +437,7 @@ def run_live(config, logger):
     if not symbols_requested:
         logger.error("No symbols specified. Exiting."); send_email_notification("GenovoTraderV2 Error", "Live Startup failed: No symbols specified.", config); return
 
-    # Initialize MT5 connection ONCE
+    # Initialize MT5 connection ONCE if not already connected
     if not initialize_mt5_connection(config, logger):
         logger.error("Failed to initialize MT5. Exiting live mode."); send_email_notification("GenovoTraderV2 Error", "Live Startup failed: Could not initialize MT5.", config); return
 
@@ -491,11 +502,13 @@ def run_live(config, logger):
             # 3. Model
             # --- Ensure num_features is correct before creating model ---
             num_actual_features = len(fp.feature_extractor.feature_names)
-            if model_cfg.get('num_features') != num_actual_features:
-                 logger.warning(f"Model config num_features ({model_cfg.get('num_features')}) != actual features ({num_actual_features}) for {symbol}. Updating config for model creation.")
-                 model_cfg['num_features'] = num_actual_features
+            # Create a copy to avoid modifying the global config for other symbols
+            symbol_model_cfg = model_cfg.copy()
+            if symbol_model_cfg.get('num_features') != num_actual_features:
+                 logger.warning(f"Model config num_features ({symbol_model_cfg.get('num_features')}) != actual features ({num_actual_features}) for {symbol}. Updating config for model creation.")
+                 symbol_model_cfg['num_features'] = num_actual_features
 
-            model = create_model(model_cfg) # Pass updated config
+            model = create_model(symbol_model_cfg) # Pass updated config
             model_path = os.path.join(load_base, f"{symbol}_final_model.pth") # Load the FINAL model
             if model_path and os.path.exists(model_path):
                 model.load_state_dict(torch.load(model_path, map_location=device))
@@ -853,45 +866,52 @@ def main():
         logger.info(f"--- Starting Genovo Trader v2 (Multi-Symbol) ---")
 
         # Determine mode
-        mode = args.mode if args.mode else config.get('mode', 'simulation')
-        config['mode'] = mode # Ensure mode is set in config dict for other modules
-        logger.info(f"Mode selected: {mode}")
+        initial_mode = args.mode if args.mode else config.get('mode', 'simulation')
+        config['mode'] = initial_mode # Ensure mode is set in config dict
+        logger.info(f"Initial Mode selected: {initial_mode}")
 
         # Log device
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         logger.info(f"Using device: {device}")
 
         # Send startup notification
-        send_email_notification("GenovoTraderV2 Started", f"Process started in '{mode}' mode.", config)
+        send_email_notification("GenovoTraderV2 Started", f"Process started in '{initial_mode}' mode.", config)
 
-        # Execute selected mode
-        if mode == 'simulation':
-            run_simulation_or_training(config, logger)
-        elif mode == 'train':
-            logger.info("Running Training mode (equivalent to simulation for now).")
-            run_simulation_or_training(config, logger)
-        elif mode == 'live':
+        # --- Execute selected mode ---
+        training_successful = True # Assume success unless training fails
+        if initial_mode == 'simulation':
+            run_simulation_or_training(config, logger, keep_mt5_connected=False)
+        elif initial_mode == 'train':
+            logger.info("Running Training mode...")
+            # Keep MT5 connected if training succeeds, as live mode will follow
+            training_successful = run_simulation_or_training(config, logger, keep_mt5_connected=True)
+            if training_successful:
+                 logger.info("Training complete. Proceeding to Live Trading mode...")
+                 config['mode'] = 'live' # Update config mode for run_live context
+                 run_live(config, logger)
+            else:
+                 logger.error("Training failed or encountered errors. Skipping transition to Live Trading.")
+                 send_email_notification("GenovoTraderV2 Warning", "Training failed, did not proceed to live trading.", config)
+        elif initial_mode == 'live':
             run_live(config, logger)
         else:
-            logger.error(f"Invalid mode '{mode}' specified.")
-            send_email_notification("GenovoTraderV2 Error", f"Startup failed: Invalid mode '{mode}'.", config)
+            logger.error(f"Invalid mode '{initial_mode}' specified.")
+            send_email_notification("GenovoTraderV2 Error", f"Startup failed: Invalid mode '{initial_mode}'.", config)
 
     except FileNotFoundError as e:
         print(f"ERROR: Configuration file not found. {e}")
-        # Logger might not be initialized yet
         if logger: logger.critical(f"Configuration file not found: {e}")
     except Exception as e:
         print(f"FATAL ERROR during execution: {e}")
         print(traceback.format_exc())
         if logger: logger.critical(f"FATAL ERROR during execution: {e}", exc_info=True)
-        # Send notification if config was loaded
         if config:
             error_details = f"Fatal error during execution:\n{traceback.format_exc()}"
             send_email_notification("GenovoTraderV2 FATAL ERROR", error_details, config)
     finally:
         if logger: logger.info("--- Genovo Trader v2 finished ---")
         else: print("--- Genovo Trader v2 finished ---")
-        # Final check for MT5 shutdown, especially if live mode failed early
+        # Final check for MT5 shutdown
         if mt5.terminal_info():
             print("Final MT5 shutdown check.")
             mt5.shutdown()

@@ -16,48 +16,32 @@ class TCNBlock(nn.Module):
     """
     def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout=0.2):
         super(TCNBlock, self).__init__()
-        # Calculate padding for causal convolution (output has same length as input)
         padding = (kernel_size - 1) * dilation
-
-        # First convolutional layer + normalization + activation + dropout
         self.conv1 = nn.utils.weight_norm(nn.Conv1d(in_channels, out_channels, kernel_size,
                                padding=padding, dilation=dilation))
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
-        # LayerNorm applied channel-wise after transposition
         self.norm1 = nn.LayerNorm(out_channels)
-
-        # Second convolutional layer + normalization + activation + dropout
         self.conv2 = nn.utils.weight_norm(nn.Conv1d(out_channels, out_channels, kernel_size,
                                padding=padding, dilation=dilation))
         self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(out_channels)
-
-        # Residual connection handling: if input/output channels differ, use a 1x1 conv
         self.residual = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-        self.output_relu = nn.ReLU() # Final activation for the block output
+        self.output_relu = nn.ReLU()
 
     def forward(self, x):
-        # x shape: [batch_size, in_channels, seq_len]
-        res = self.residual(x) # Calculate residual connection path
-
-        # First conv block
+        res = self.residual(x)
         out = self.conv1(x)
-        out = out[..., :x.size(-1)] # Trim padding to maintain sequence length
-        # Apply LayerNorm on the feature dimension (transpose needed)
+        out = out[..., :x.size(-1)]
         out = self.norm1(out.transpose(1, 2)).transpose(1, 2)
         out = self.relu1(out)
         out = self.dropout1(out)
-
-        # Second conv block
         out = self.conv2(out)
-        out = out[..., :x.size(-1)] # Trim padding
+        out = out[..., :x.size(-1)]
         out = self.norm2(out.transpose(1, 2)).transpose(1, 2)
         out = self.relu2(out)
         out = self.dropout2(out)
-
-        # Add residual and apply final activation
         return self.output_relu(out + res)
 
 
@@ -66,12 +50,9 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads, dropout=0.1):
         super(MultiHeadAttention, self).__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
-
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
-
-        # Linear layers for Query, Key, Value, and final output projection
         self.q_linear = nn.Linear(d_model, d_model)
         self.k_linear = nn.Linear(d_model, d_model)
         self.v_linear = nn.Linear(d_model, d_model)
@@ -79,36 +60,18 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
-        # x shape: [batch_size, seq_len, d_model]
         batch_size = x.size(0)
-
-        # Project and reshape for multi-head attention
-        # q, k, v shape: [batch_size, num_heads, seq_len, head_dim]
         q = self.q_linear(x).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_linear(x).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_linear(x).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # Calculate attention scores (scaled dot-product)
-        # scores shape: [batch_size, num_heads, seq_len, seq_len]
         scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.head_dim)
-
-        # Apply mask if provided (for preventing attention to future positions)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, float('-inf'))
-
-        # Apply softmax to get attention weights
         attention_weights = F.softmax(scores, dim=-1)
         attention_weights = self.dropout(attention_weights)
-
-        # Apply attention weights to values
-        # context shape: [batch_size, num_heads, seq_len, head_dim]
         context = torch.matmul(attention_weights, v)
-
-        # Concatenate heads and apply final linear layer
-        # context shape: [batch_size, seq_len, d_model]
         context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
         output = self.out_linear(context)
-
         return output
 
 
@@ -119,7 +82,6 @@ class TransformerEncoderBlock(nn.Module):
         self.attention = MultiHeadAttention(d_model, num_heads, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        # Feed-forward network
         self.feedforward = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.ReLU(),
@@ -129,17 +91,12 @@ class TransformerEncoderBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
-        # x shape: [batch_size, seq_len, d_model]
-        # Self-attention sublayer
         attn_output = self.attention(x, mask)
-        x = x + self.dropout(attn_output) # Add & Norm (residual connection)
+        x = x + self.dropout(attn_output)
         x = self.norm1(x)
-
-        # Feed-forward sublayer
         ff_output = self.feedforward(x)
-        x = x + self.dropout(ff_output) # Add & Norm (residual connection)
+        x = x + self.dropout(ff_output)
         x = self.norm2(x)
-
         return x
 
 
@@ -160,16 +117,17 @@ class EnhancedTradingModel(nn.Module):
                  dropout=0.2):
         super(EnhancedTradingModel, self).__init__()
 
-        # --- !! Add Logging Here !! ---
         logger.info(f"Initializing EnhancedTradingModel with num_features = {num_features}")
-        # --- End Logging ---
+        if not isinstance(num_features, int) or num_features <= 0:
+             raise ValueError(f"num_features must be a positive integer, got: {num_features}")
 
         self.hidden_size = hidden_size
+        self.num_features = num_features # Store num_features
 
         # --- Input Layer ---
-        # LayerNorm on input features
-        self.layer_norm_input = nn.LayerNorm(num_features)
-        tcn_input_channels = num_features # Input to TCN is original features
+        # --- !! FIX HERE: Ensure LayerNorm uses num_features !! ---
+        self.layer_norm_input = nn.LayerNorm(self.num_features)
+        tcn_input_channels = self.num_features # Input to TCN is original features
 
         # --- Temporal Convolutional Network (TCN) ---
         self.tcn_layers = nn.ModuleList()
@@ -196,135 +154,55 @@ class EnhancedTradingModel(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_size) # LayerNorm after transformers
 
         # --- Output Heads ---
-        # Use the output of the *last* time step from the final layer for predictions
-
-        # Policy head (Action prediction: Buy, Sell, Hold)
-        self.policy_head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 3)  # Logits for 3 actions
-        )
-
-        # Value head (Critic's state value estimation)
-        self.value_head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1)
-        )
-
-        # Position size suggestion head (e.g., fraction of max capital)
-        self.position_size_head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1),
-            nn.Sigmoid()  # Output between 0 and 1
-        )
-
-        # Uncertainty prediction head (e.g., predicting variance or confidence)
-        self.uncertainty_head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, 1),
-            nn.Softplus()  # Ensure output is positive
-        )
-
-        # Stop loss suggestion head (e.g., percentage distance from entry)
-        self.stop_loss_head = nn.Sequential(
-            nn.Linear(hidden_size, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
-            nn.Sigmoid() # Output between 0 and 1 (representing fraction, e.g., 0.01 = 1%)
-        )
-
-        # Take profit suggestion head (e.g., percentage distance from entry)
-        self.take_profit_head = nn.Sequential(
-            nn.Linear(hidden_size, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
-            nn.Sigmoid() # Output between 0 and 1 (e.g., 0.02 = 2%)
-        )
-
-        # Trade horizon prediction head (e.g., number of steps to hold)
-        self.trade_horizon_head = nn.Sequential(
-            nn.Linear(hidden_size, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
-            nn.Softplus() # Ensure positive output
-        )
-
-        # Market regime detection head (e.g., Trending, Mean-Reverting, Uncertain)
-        self.regime_detection_head = nn.Sequential(
-            nn.Linear(hidden_size, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 3)  # Logits for 3 regimes
-        )
-
-        # Volatility prediction head (e.g., predicted ATR or std dev)
-        self.volatility_prediction_head = nn.Sequential(
-            nn.Linear(hidden_size, 32),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1),
-            nn.Softplus() # Ensure positive output
-        )
+        # (Output heads remain the same)
+        self.policy_head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 3))
+        self.value_head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 1))
+        self.position_size_head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 1), nn.Sigmoid())
+        self.uncertainty_head = nn.Sequential(nn.Linear(hidden_size, 64), nn.ReLU(), nn.Dropout(dropout), nn.Linear(64, 1), nn.Softplus())
+        self.stop_loss_head = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 1), nn.Sigmoid())
+        self.take_profit_head = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 1), nn.Sigmoid())
+        self.trade_horizon_head = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 1), nn.Softplus())
+        self.regime_detection_head = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 3))
+        self.volatility_prediction_head = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 1), nn.Softplus())
 
 
     def forward(self, x):
         # x shape: [batch_size, seq_len, num_features]
+        if x.shape[-1] != self.num_features:
+             logger.error(f"Model forward pass input feature dimension mismatch! Expected {self.num_features}, got {x.shape[-1]}")
+             # Handle error appropriately, e.g., raise ValueError
+             raise ValueError(f"Input feature dimension mismatch: Expected {self.num_features}, got {x.shape[-1]}")
+
 
         # 1. Input Layer Normalization
         try:
+            # --- Ensure this uses the correct dimension ---
             x = self.layer_norm_input(x)
         except Exception as e:
              logger.error(f"Error in layer_norm_input: {e}. Input shape: {x.shape}", exc_info=True)
-             raise # Re-raise the exception after logging
+             raise
 
         # 2. TCN Layers
-        # Reshape for Conv1d: [batch_size, num_features, seq_len]
         x = x.transpose(1, 2)
         for i, tcn_layer in enumerate(self.tcn_layers):
-            try:
-                x = tcn_layer(x)
-            except Exception as e:
-                logger.error(f"Error in TCN layer {i}: {e}. Input shape: {x.shape}", exc_info=True)
-                raise
-        # Reshape back: [batch_size, seq_len, tcn_output_channels]
+            try: x = tcn_layer(x)
+            except Exception as e: logger.error(f"Error in TCN layer {i}: {e}. Input shape: {x.shape}", exc_info=True); raise
         x = x.transpose(1, 2)
 
         # 3. GRU Layer
-        try:
-            gru_output, hidden = self.gru(x)
-        except Exception as e:
-            logger.error(f"Error in GRU layer: {e}. Input shape: {x.shape}", exc_info=True)
-            raise
+        try: gru_output, hidden = self.gru(x)
+        except Exception as e: logger.error(f"Error in GRU layer: {e}. Input shape: {x.shape}", exc_info=True); raise
 
         # 4. Transformer Encoder Layers
-        transformer_output = gru_output # Input to transformer is GRU output sequence
+        transformer_output = gru_output
         for i, transformer_layer in enumerate(self.transformer_layers):
-            try:
-                # Masking usually not needed for encoder-only structure on full sequence
-                transformer_output = transformer_layer(transformer_output)
-            except Exception as e:
-                 logger.error(f"Error in Transformer layer {i}: {e}. Input shape: {transformer_output.shape}", exc_info=True)
-                 raise
-        try:
-             transformer_output = self.final_norm(transformer_output)
-        except Exception as e:
-             logger.error(f"Error in final_norm: {e}. Input shape: {transformer_output.shape}", exc_info=True)
-             raise
-
+            try: transformer_output = transformer_layer(transformer_output)
+            except Exception as e: logger.error(f"Error in Transformer layer {i}: {e}. Input shape: {transformer_output.shape}", exc_info=True); raise
+        try: transformer_output = self.final_norm(transformer_output)
+        except Exception as e: logger.error(f"Error in final_norm: {e}. Input shape: {transformer_output.shape}", exc_info=True); raise
 
         # 5. Extract Last Time Step Output for Heads
-        # Use the output from the transformer's last time step
-        last_step_output = transformer_output[:, -1, :] # Shape: [batch_size, hidden_size]
+        last_step_output = transformer_output[:, -1, :]
 
         # 6. Calculate Outputs from Heads
         try:
@@ -343,18 +221,10 @@ class EnhancedTradingModel(nn.Module):
 
         # Return all outputs in a dictionary
         return {
-            'policy_logits': policy_logits,
-            'value': value,
-            'position_size': position_size,
-            'uncertainty': uncertainty,
-            'stop_loss': stop_loss,       # Predicted SL percentage (0 to 1)
-            'take_profit': take_profit,   # Predicted TP percentage (0 to 1)
-            'trade_horizon': trade_horizon, # Predicted holding steps
-            'regime_logits': regime_logits, # Logits for market regimes
-            'volatility': volatility,     # Predicted volatility measure
-            # Include intermediate outputs if needed for analysis/debugging
-            'gru_last_hidden': hidden[-1], # Last hidden state from GRU (last layer)
-            'transformer_output': transformer_output # Full output sequence from transformer
+            'policy_logits': policy_logits, 'value': value, 'position_size': position_size,
+            'uncertainty': uncertainty, 'stop_loss': stop_loss, 'take_profit': take_profit,
+            'trade_horizon': trade_horizon, 'regime_logits': regime_logits, 'volatility': volatility,
+            'gru_last_hidden': hidden[-1], 'transformer_output': transformer_output
         }
 
 
@@ -362,31 +232,20 @@ class EnhancedTradingModel(nn.Module):
 def create_model(config):
     """
     Factory function to create the EnhancedTradingModel based on configuration.
-
-    Args:
-        config (dict): Configuration dictionary containing model parameters.
-                       Expected keys: 'num_features', 'seq_length', 'hidden_size',
-                       'num_layers', 'tcn_channels', 'tcn_kernel_size',
-                       'num_heads', 'num_transformer_layers', 'dropout'.
-
-    Returns:
-        EnhancedTradingModel: The instantiated trading model.
+    Ensures 'num_features' is correctly passed.
     """
-    model_config = config # Expect model_config directly now
+    model_config = config # Expect model_config directly
     num_features = model_config.get('num_features')
     if num_features is None:
-         # Attempt to get from feature_config if model_config is missing it
-         # This is a fallback, ideally num_features is set correctly in model_config
-         logger.warning("num_features not found in model_config, trying feature_config (this might be incorrect).")
-         # Need access to the full config here, which might not be available.
-         # Best practice: Ensure num_features is correctly set in model_config in main.py
-         # Forcing a default or raising error might be better.
+         logger.error("num_features is missing in model_config during model creation.")
          raise ValueError("num_features is missing in model_config.")
+    if not isinstance(num_features, int) or num_features <= 0:
+        raise ValueError(f"Invalid num_features in model_config: {num_features}")
 
 
     return EnhancedTradingModel(
-        num_features=num_features, # Use the determined num_features
-        seq_length=model_config.get('seq_length', 201), # Use updated default
+        num_features=num_features, # Use the validated num_features
+        seq_length=model_config.get('seq_length', 201),
         hidden_size=model_config.get('hidden_size', 128),
         num_layers=model_config.get('num_layers', 2),
         tcn_channels=model_config.get('tcn_channels', [64, 128, 128]),
@@ -395,4 +254,3 @@ def create_model(config):
         num_transformer_layers=model_config.get('num_transformer_layers', 2),
         dropout=model_config.get('dropout', 0.2)
     )
-
