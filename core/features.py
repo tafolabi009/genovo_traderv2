@@ -11,6 +11,9 @@ from collections import deque
 import joblib # Keep joblib for scaler persistence
 import os
 import warnings # To suppress specific pandas_ta warnings if needed
+import logging # Import logging
+
+logger = logging.getLogger("genovo_traderv2") # Get logger
 
 # Suppress specific PerformanceWarnings from pandas_ta if they become noisy
 # warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
@@ -19,381 +22,274 @@ class FeatureExtractor:
     """
     Comprehensive feature extraction pipeline using pandas-ta.
     Generates price, volume, technical, statistical, volatility,
-    trend, seasonality features.
+    trend, seasonality features. Includes Donchian Channel.
     Includes robust scaler fitting and transformation.
     """
     def __init__(self, config=None):
         self.config = config or {}
-        self.window_sizes = self.config.get('window_sizes', [5, 10, 20, 50, 100])
-        self.feature_names = [] # Stores names of features the scaler is fitted on
+        self.window_sizes = self.config.get('window_sizes', [5, 10, 20, 50, 100, 200]) # Keep 200 for other features
+        # --- Donchian Config ---
+        # Use lengths appropriate for your timeframe (M1).
+        # 50 weeks = 50*5*24*60 = 360,000 M1 bars (too long!)
+        # Let's use shorter, more typical lengths for M1, e.g., related to hours/days
+        # Example: ~4 hours (240), ~8 hours (480), ~1 day (1440)
+        self.donchian_lower_length = self.config.get('donchian_lower', 240) # e.g., 4-hour low
+        self.donchian_upper_length = self.config.get('donchian_upper', 480) # e.g., 8-hour high
+        # --- End Donchian Config ---
 
+        self.feature_names = [] # Stores names of features the scaler is fitted on
         self.scaler = StandardScaler()
         self.is_fitted = False
-        # Buffers not currently used in feature calculation but kept for potential future use
-        self.tick_buffer = deque(maxlen=200)
+        self.tick_buffer = deque(maxlen=max(self.window_sizes + [self.donchian_lower_length, self.donchian_upper_length])) # Adjust buffer if needed
         self.order_book_buffer = deque(maxlen=200)
-
-        # Store mean/std for potential unscaling or analysis
         self.feature_means = None
         self.feature_stds = None
-        print("FeatureExtractor initialized (using pandas-ta).")
+        # print("FeatureExtractor initialized (using pandas-ta).")
 
     def fit(self, market_data):
-        """
-        Fits the scaler based on historical market data.
-        Only fits on numeric features without NaN/inf values.
-        """
+        """ Fits the scaler based on historical market data. """
         if market_data is None or market_data.empty:
-             print("Warning: Empty market data provided for fitting. Scaler not fitted.")
-             self.is_fitted = False
-             return self
-
-        print(f"Fitting scaler on initial data ({len(market_data)} rows)...")
-        features = self._extract_all_features(market_data) # Extract raw features
-
-        # --- Robust Cleaning Before Fit ---
-        # 1. Identify numeric columns
+             self.is_fitted = False; return self
+        features = self._extract_all_features(market_data)
         numeric_cols = features.select_dtypes(include=np.number).columns.tolist()
-        if not numeric_cols:
-             print("Warning: No numeric features generated during fit. Scaler not fitted.")
-             self.is_fitted = False
-             return self
+        if not numeric_cols: self.is_fitted = False; return self
         features_numeric = features[numeric_cols]
-
-        # 2. Handle Infinite values
         features_numeric = features_numeric.replace([np.inf, -np.inf], np.nan)
-
-        # 3. Handle NaNs (Drop rows with any NaNs in numeric columns for fitting)
-        initial_len = len(features_numeric)
-        # Fill NaNs before fitting instead of dropping rows to keep data length consistent
         features_filled = features_numeric.ffill().bfill()
-        # Check if any NaNs remain (e.g., if the entire column was NaN initially)
         cols_with_nans = features_filled.columns[features_filled.isnull().any()].tolist()
-        if cols_with_nans:
-             print(f"Warning: Columns still contain NaNs after filling: {cols_with_nans}. Dropping these columns for fitting.")
-             features_cleaned = features_filled.drop(columns=cols_with_nans)
-        else:
-             features_cleaned = features_filled
-
-        # Drop columns with zero variance (constant columns) before fitting
+        if cols_with_nans: features_cleaned = features_filled.drop(columns=cols_with_nans)
+        else: features_cleaned = features_filled
         cols_to_drop = features_cleaned.columns[features_cleaned.var() == 0]
-        if not cols_to_drop.empty:
-             print(f"Warning: Dropping constant columns before fitting scaler: {cols_to_drop.tolist()}")
-             features_cleaned = features_cleaned.drop(columns=cols_to_drop)
-
-
-        if features_cleaned.empty:
-            print("Warning: No valid numeric features remaining after cleaning/dropping constant columns. Scaler not fitted.")
-            self.is_fitted = False
-            return self
-
+        if not cols_to_drop.empty: features_cleaned = features_cleaned.drop(columns=cols_to_drop)
+        if features_cleaned.empty: self.is_fitted = False; return self
         try:
-            # Fit scaler only on the cleaned numeric data
             self.scaler.fit(features_cleaned)
             self.is_fitted = True
-            # Store names of the columns the scaler was actually fitted on
             self.feature_names = features_cleaned.columns.tolist()
-            # Store means/stds for reference
             self.feature_means = features_cleaned.mean()
             self.feature_stds = features_cleaned.std()
-            print(f"FeatureExtractor fitted with {len(self.feature_names)} numeric features.")
-
+            logger.info(f"FeatureExtractor fitted with {len(self.feature_names)} numeric features.") # Log actual count
         except ValueError as e:
-             print(f"Error fitting scaler: {e}. Check for constant features or other issues.")
-             self.is_fitted = False
-             self.feature_names = []
-
+             logger.error(f"Error fitting scaler: {e}. Check for constant features or other issues.", exc_info=True)
+             self.is_fitted = False; self.feature_names = []
         return self
 
     def transform(self, raw_features_data):
-        """
-        Transforms pre-calculated raw features into a scaled feature matrix
-        using the fitted scaler. Handles missing columns and potential NaN/inf values robustly.
-
-        Args:
-            raw_features_data (pd.DataFrame): DataFrame containing pre-calculated,
-                                              but **unscaled**, features.
-
-        Returns:
-            pd.DataFrame: Scaled feature DataFrame.
-        """
+        """ Transforms pre-calculated raw features into a scaled feature matrix. """
         if not self.is_fitted:
-            print("Error: Scaler not fitted. Cannot transform features.")
-            # Return empty DataFrame with expected columns if possible
+            logger.error("Scaler not fitted. Cannot transform features.")
             return pd.DataFrame(columns=self.feature_names)
-
         if raw_features_data is None or raw_features_data.empty:
-             print("Warning: Empty raw features data provided for transform.")
-             # Return empty DataFrame with expected columns if possible
+             logger.warning("Empty raw features data provided for transform.")
              return pd.DataFrame(columns=self.feature_names)
 
-        features = raw_features_data.copy() # Work on a copy
-
-        # 1. Select only the features the scaler was trained on
-        #    Also, ensure the order of columns matches the scaler's expectations
+        features = raw_features_data.copy()
         cols_to_scale = []
         missing_cols = []
-        extra_cols = list(features.columns) # Start with all columns in input
-
-        for col in self.feature_names: # Iterate through columns scaler expects
+        extra_cols = list(features.columns)
+        for col in self.feature_names:
             if col in features.columns:
                 cols_to_scale.append(col)
-                if col in extra_cols: extra_cols.remove(col) # Remove found columns from extras
-            else:
-                missing_cols.append(col) # Scaler expected this, but it's missing
-
-        if missing_cols:
-             print(f"Warning: Features missing during transform (needed by scaler): {missing_cols}. They will be added and filled with 0.")
-        if extra_cols:
-             print(f"Warning: Extra features found during transform (not used by scaler): {extra_cols}. They will be dropped.")
-
+                if col in extra_cols: extra_cols.remove(col)
+            else: missing_cols.append(col)
+        # if missing_cols: logger.warning(f"Features missing during transform (needed by scaler): {missing_cols}. They will be added and filled with 0.") # Reduce log noise
+        # if extra_cols: logger.debug(f"Extra features found during transform (not used by scaler): {extra_cols}. They will be dropped.") # Reduce log noise
         if not cols_to_scale:
-             print("Warning: No features available to scale matching the fitted scaler.")
-             # Return DataFrame with expected columns filled with 0
+             logger.warning("No features available to scale matching the fitted scaler.")
              return pd.DataFrame(0, index=features.index, columns=self.feature_names)
 
-        # Select only the columns to be scaled, in the correct order
         features_to_scale_df = features[cols_to_scale]
-
-        # 2. Clean features before scaling (handle inf/NaN)
         features_to_scale_df = features_to_scale_df.replace([np.inf, -np.inf], np.nan)
-        # Fill NaNs *before* scaling (e.g., forward fill then backward fill)
         features_filled = features_to_scale_df.ffill().bfill()
-
-        # Check if any NaNs remain after filling (e.g., if a whole column was NaN)
         if features_filled.isnull().values.any():
-             print("Warning: NaNs still present after ffill/bfill before scaling. Filling remaining NaNs with 0.")
+             # logger.warning("NaNs still present after ffill/bfill before scaling. Filling remaining NaNs with 0.")
              features_filled.fillna(0, inplace=True) # Fill remaining with 0
 
         try:
-             # 3. Scale the cleaned and filled data
              scaled_array = self.scaler.transform(features_filled)
              scaled_features = pd.DataFrame(scaled_array, index=features_filled.index, columns=cols_to_scale)
-
-             # 4. Reintroduce any missing fitted columns filled with zeros (or mean/median)
-             # This ensures the output always has the columns the model expects
              if missing_cols:
-                  for col in missing_cols:
-                       # Fill with 0 after scaling (mean of scaled data)
-                       scaled_features[col] = 0.0
-                  # Reorder columns to match the original fitted order
+                  for col in missing_cols: scaled_features[col] = 0.0
                   scaled_features = scaled_features[self.feature_names]
-
              return scaled_features
-
         except ValueError as e:
-             print(f"Error transforming features: {e}. Returning empty DataFrame.")
-             return pd.DataFrame(columns=self.feature_names) # Return empty on error
+             logger.error(f"Error transforming features: {e}. Returning empty DataFrame.", exc_info=True)
+             return pd.DataFrame(columns=self.feature_names)
         except Exception as e:
-             print(f"Unexpected error during feature transformation: {e}")
-             return pd.DataFrame(columns=self.feature_names) # Return empty on error
+             logger.error(f"Unexpected error during feature transformation: {e}", exc_info=True)
+             return pd.DataFrame(columns=self.feature_names)
 
-    # --- save_scaler, load_scaler, _extract_all_features, and _add_* methods remain the same ---
     def save_scaler(self, path):
         """Saves the fitted scaler and feature names to a file using joblib."""
         if self.is_fitted:
             try:
-                scaler_state = {
-                    'scaler': self.scaler,
-                    'feature_names': self.feature_names,
-                    'feature_means': self.feature_means,
-                    'feature_stds': self.feature_stds
-                }
+                scaler_state = {'scaler': self.scaler, 'feature_names': self.feature_names, 'feature_means': self.feature_means, 'feature_stds': self.feature_stds}
+                os.makedirs(os.path.dirname(path), exist_ok=True)
                 joblib.dump(scaler_state, path)
-                print(f"Scaler state saved to {path}")
+                logger.info(f"Scaler state saved successfully to {path}")
+                return True
             except Exception as e:
-                print(f"Error saving scaler state to {path}: {e}")
+                logger.error(f"Error saving scaler state to {path}: {e}", exc_info=True)
+                return False
         else:
-            print("Scaler not fitted. Cannot save state.")
+            logger.warning("Scaler not fitted. Cannot save state.")
+            return False
 
     def load_scaler(self, path):
         """Loads the scaler and feature names from a file using joblib."""
+        logger.debug(f"Attempting to load scaler state from: {path}")
         if os.path.exists(path):
             try:
                 scaler_state = joblib.load(path)
+                if 'scaler' not in scaler_state or 'feature_names' not in scaler_state:
+                     logger.error(f"Invalid scaler state file format in {path}. Missing 'scaler' or 'feature_names'.")
+                     self.is_fitted = False; self.feature_names = []; return
                 self.scaler = scaler_state['scaler']
                 self.feature_names = scaler_state['feature_names']
-                self.feature_means = scaler_state.get('feature_means') # Load if exists
-                self.feature_stds = scaler_state.get('feature_stds')   # Load if exists
+                self.feature_means = scaler_state.get('feature_means')
+                self.feature_stds = scaler_state.get('feature_stds')
                 self.is_fitted = True
-                print(f"Scaler state loaded successfully from {path} ({len(self.feature_names)} features).")
+                logger.info(f"Scaler state loaded successfully from {path} ({len(self.feature_names)} features).")
+            except ModuleNotFoundError as e:
+                 logger.error(f"Error loading scaler state from {path}: Module not found. Sklearn version mismatch? Error: {e}", exc_info=True)
+                 self.is_fitted = False; self.feature_names = []
+            except EOFError as e:
+                 logger.error(f"Error loading scaler state from {path}: EOFError. File might be corrupted or incomplete. Error: {e}", exc_info=True)
+                 self.is_fitted = False; self.feature_names = []
             except Exception as e:
-                print(f"Error loading scaler state from {path}: {e}. Scaler remains unfitted.")
-                self.is_fitted = False
-                self.feature_names = []
+                logger.error(f"Error loading scaler state from {path}: {type(e).__name__}: {e}", exc_info=True)
+                self.is_fitted = False; self.feature_names = []
         else:
-            print(f"Scaler state file not found at {path}. Scaler remains unfitted.")
-            self.is_fitted = False
-            self.feature_names = []
+            logger.error(f"Scaler state file not found at {path}. Scaler remains unfitted.")
+            self.is_fitted = False; self.feature_names = []
 
 
     def _extract_all_features(self, market_data):
         """Internal method to orchestrate feature extraction using pandas-ta."""
         df = market_data.copy()
         required_cols = ['open', 'high', 'low', 'close', 'volume']
-        # Standardize column names to lowercase at the beginning
         df.columns = df.columns.str.lower()
         if not all(col in df.columns for col in required_cols):
             raise ValueError(f"Market data must contain columns: {required_cols}")
 
-        # --- Use pandas-ta Strategy or individual indicators ---
+        # Calculate features, catching potential errors for individual groups
         try: self._add_price_features_pta(df)
-        except Exception as e: print(f"Error adding price features: {e}")
-
+        except Exception as e: logger.warning(f"Warning during price features: {e}")
         try: self._add_volume_features_pta(df)
-        except Exception as e: print(f"Error adding volume features: {e}")
-
+        except Exception as e: logger.warning(f"Warning during volume features: {e}")
         try: self._add_technical_indicators_pta(df)
-        except Exception as e: print(f"Error adding technical indicators: {e}")
-
+        except Exception as e: logger.warning(f"Warning during technical indicators: {e}")
         try: self._add_statistical_features_pta(df)
-        except Exception as e: print(f"Error adding statistical features: {e}")
-
+        except Exception as e: logger.warning(f"Warning during statistical features: {e}")
         try: self._add_volatility_features_pta(df)
-        except Exception as e: print(f"Error adding volatility features: {e}")
-
+        except Exception as e: logger.warning(f"Warning during volatility features: {e}")
         try: self._add_trend_features_pta(df)
-        except Exception as e: print(f"Error adding trend features: {e}")
-
+        except Exception as e: logger.warning(f"Warning during trend features: {e}")
         try: self._add_seasonality_features(df)
-        except Exception as e: print(f"Error adding seasonality features: {e}")
+        except Exception as e: logger.warning(f"Warning during seasonality features: {e}")
+        # --- Add Donchian Channel ---
+        try: self._add_donchian_channel_pta(df)
+        except Exception as e: logger.warning(f"Warning during Donchian Channel calculation: {e}")
+        # --- End Add Donchian Channel ---
 
-        # Select only the calculated feature columns (excluding original OHLCV)
+
         original_cols = ['open', 'high', 'low', 'close', 'volume']
         features = df.drop(columns=original_cols, errors='ignore')
-
-        # Final check for inf values (should be handled earlier, but as safety)
         features.replace([np.inf, -np.inf], np.nan, inplace=True)
-
         return features
 
     # --- Individual Feature Group Methods using pandas-ta ---
-    # (Keep these methods as they were, they use pandas-ta correctly)
+    # (Keep existing methods: _add_price_features_pta, _add_volume_features_pta, etc.)
     def _add_price_features_pta(self, df):
-        """Adds price-based features using pandas-ta."""
-        df.ta.log_return(cumulative=False, append=True) # Adds 'LOGRET_1'
-        df.ta.percent_return(cumulative=False, append=True) # Adds 'PERCENT_1'
-
-        # Ratios (calculate manually)
-        # Use .loc to avoid SettingWithCopyWarning if df is a slice
+        df.ta.log_return(cumulative=False, append=True)
+        df.ta.percent_return(cumulative=False, append=True)
         df.loc[:, 'high_low_ratio'] = (df['high'] / df['low']).replace([np.inf, -np.inf], np.nan)
         df.loc[:, 'close_open_ratio'] = (df['close'] / df['open']).replace([np.inf, -np.inf], np.nan)
-
         for window in self.window_sizes:
-            df.ta.sma(length=window, append=True) # Adds SMA_window
-            df.ta.ema(length=window, append=True) # Adds EMA_window
-            # Price relative to MA (calculate manually)
-            sma_col = f'SMA_{window}'
-            ema_col = f'EMA_{window}'
-            if sma_col in df.columns:
-                 df.loc[:, f'price_vs_sma_{window}'] = (df['close'] / df[sma_col]).replace([np.inf, -np.inf], np.nan)
-            if ema_col in df.columns:
-                 df.loc[:, f'price_vs_ema_{window}'] = (df['close'] / df[ema_col]).replace([np.inf, -np.inf], np.nan)
-            df.ta.mom(length=window, append=True) # Adds MOM_window
-
-        # MA Crossover (calculate manually)
+            df.ta.sma(length=window, append=True)
+            df.ta.ema(length=window, append=True)
+            sma_col = f'SMA_{window}'; ema_col = f'EMA_{window}'
+            if sma_col in df.columns: df.loc[:, f'price_vs_sma_{window}'] = (df['close'] / df[sma_col]).replace([np.inf, -np.inf], np.nan)
+            if ema_col in df.columns: df.loc[:, f'price_vs_ema_{window}'] = (df['close'] / df[ema_col]).replace([np.inf, -np.inf], np.nan)
+            df.ta.mom(length=window, append=True)
         if 5 in self.window_sizes and 20 in self.window_sizes:
-             sma5, sma20 = 'SMA_5', 'SMA_20'
-             ema5, ema20 = 'EMA_5', 'EMA_20'
-             if sma5 in df.columns and sma20 in df.columns:
-                  df.loc[:, 'sma_5_20_diff'] = df[sma5] - df[sma20]
-             if ema5 in df.columns and ema20 in df.columns:
-                  df.loc[:, 'ema_5_20_diff'] = df[ema5] - df[ema20]
+             sma5, sma20 = 'SMA_5', 'SMA_20'; ema5, ema20 = 'EMA_5', 'EMA_20'
+             if sma5 in df.columns and sma20 in df.columns: df.loc[:, 'sma_5_20_diff'] = df[sma5] - df[sma20]
+             if ema5 in df.columns and ema20 in df.columns: df.loc[:, 'ema_5_20_diff'] = df[ema5] - df[ema20]
 
     def _add_volume_features_pta(self, df):
-        """Adds volume-based features using pandas-ta."""
         df.loc[:, 'log_volume'] = np.log1p(df['volume'])
-
         for window in self.window_sizes:
-            # Use the original 'volume' column for SMA calculation
-            df.ta.sma(close='volume', length=window, prefix='VOL', append=True) # Adds VOL_SMA_window
-            # Volume relative to its SMA (calculate manually)
+            df.ta.sma(close='volume', length=window, prefix='VOL', append=True)
             vol_sma_col = f'VOL_SMA_{window}'
-            if vol_sma_col in df.columns:
-                 df.loc[:, f'volume_vs_sma_{window}'] = (df['volume'] / df[vol_sma_col]).replace([np.inf, -np.inf], np.nan)
-
-        df.ta.obv(append=True) # Adds 'OBV'
+            if vol_sma_col in df.columns: df.loc[:, f'volume_vs_sma_{window}'] = (df['volume'] / df[vol_sma_col]).replace([np.inf, -np.inf], np.nan)
+        df.ta.obv(append=True)
 
     def _add_technical_indicators_pta(self, df):
-        """Adds common technical indicators using pandas-ta."""
-        df.ta.rsi(length=14, append=True) # Adds RSI_14
-        df.ta.macd(fast=12, slow=26, signal=9, append=True) # Adds MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
-        df.ta.bbands(length=20, std=2, append=True) # Adds BBL_20_2.0, BBM_20_2.0, BBU_20_2.0, BBB_20_2.0, BBP_20_2.0
-        df.ta.stoch(k=14, d=3, smooth_k=3, append=True) # Adds STOCHk_14_3_3, STOCHd_14_3_3
-        df.ta.adx(length=14, append=True) # Adds ADX_14, DMP_14, DMN_14
-        df.ta.cci(length=14, append=True) # Adds CCI_14_0.015
-        df.ta.willr(length=14, append=True) # Adds WILLR_14
+        df.ta.rsi(length=14, append=True)
+        df.ta.macd(fast=12, slow=26, signal=9, append=True)
+        df.ta.bbands(length=20, std=2, append=True)
+        df.ta.stoch(k=14, d=3, smooth_k=3, append=True)
+        df.ta.adx(length=14, append=True)
+        df.ta.cci(length=14, append=True)
+        df.ta.willr(length=14, append=True)
 
     def _add_statistical_features_pta(self, df):
-        """Adds rolling statistical features using pandas-ta."""
-        log_returns_col = 'LOGRET_1' # Default name from pandas-ta
-        if log_returns_col not in df.columns:
-             print("Warning: Log returns column 'LOGRET_1' not found for statistical features.")
-             # Attempt to calculate log returns if missing
-             df.ta.log_return(cumulative=False, append=True)
-             if log_returns_col not in df.columns:
-                  print("Error: Failed to calculate log returns. Skipping statistical features.")
-                  return # Skip if log returns still cannot be calculated
-
-        # Ensure log returns column is numeric and handle potential NaNs before rolling calculations
-        df[log_returns_col] = pd.to_numeric(df[log_returns_col], errors='coerce')
-        df[log_returns_col] = df[log_returns_col].fillna(0) # Fill NaNs with 0 for rolling calculations
-
+        log_returns_col = 'LOGRET_1'
+        if log_returns_col not in df.columns: df.ta.log_return(cumulative=False, append=True)
+        if log_returns_col not in df.columns: logger.error("Failed to calculate log returns. Skipping statistical features."); return
+        df[log_returns_col] = pd.to_numeric(df[log_returns_col], errors='coerce').fillna(0)
         for window in self.window_sizes:
             if window <= 1: continue
-            # Use the log returns column directly with pandas-ta indicators that accept 'close' argument
-            df.ta.stdev(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}") # Adds STDEV_window_LOGRET_1
-            df.ta.skew(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}") # Adds SKEW_window_LOGRET_1
-            df.ta.kurtosis(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}") # Adds KURT_window_LOGRET_1
-
-            # Z-Score (calculate manually using pandas rolling mean/std)
+            df.ta.stdev(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}")
+            df.ta.skew(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}")
+            df.ta.kurtosis(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}")
             rolling_mean = df[log_returns_col].rolling(window=window).mean()
-            rolling_std = df[log_returns_col].rolling(window=window).std()
-            # Avoid division by zero or near-zero std dev
-            rolling_std = rolling_std.replace(0, np.nan) # Replace 0 std with NaN
-            df.loc[:, f'roll_zscore_{window}'] = ((df[log_returns_col] - rolling_mean) / rolling_std).fillna(0) # Fill resulting NaNs with 0
+            rolling_std = df[log_returns_col].rolling(window=window).std().replace(0, np.nan)
+            df.loc[:, f'roll_zscore_{window}'] = ((df[log_returns_col] - rolling_mean) / rolling_std).fillna(0)
 
     def _add_volatility_features_pta(self, df):
-        """Adds volatility features using pandas-ta."""
-        df.ta.atr(length=14, append=True) # Adds ATR_14
-
-        # GARCH-like proxies (calculate manually using returns)
-        log_returns = df.get('LOGRET_1', pd.Series(dtype=float)).fillna(0) # Get log returns safely
+        df.ta.atr(length=14, append=True)
+        log_returns = df.get('LOGRET_1', pd.Series(dtype=float)).fillna(0)
         abs_log_returns = np.abs(log_returns)
         for window in self.window_sizes:
              if window <= 1: continue
              df.loc[:, f'abs_ret_ma_{window}'] = abs_log_returns.rolling(window=window).mean()
-             df.loc[:, f'vol_of_vol_{window}'] = abs_log_returns.rolling(window=window).std().fillna(0) # Fill NaN std dev
+             df.loc[:, f'vol_of_vol_{window}'] = abs_log_returns.rolling(window=window).std().fillna(0)
 
     def _add_trend_features_pta(self, df):
-        """Adds trend detection features using pandas-ta."""
-        # Use ADX already calculated in technical indicators
-        # df['adx'] = df['ADX_14'] # Example alias if needed
-
-        # Aroon Indicator
-        df.ta.aroon(length=14, append=True) # Adds AROOND_14, AROONU_14, AROONOSC_14
+        df.ta.aroon(length=14, append=True)
 
     def _add_seasonality_features(self, df):
-        """Adds time-based features (hour, day of week)."""
         if isinstance(df.index, pd.DatetimeIndex):
-            # Use .loc to avoid SettingWithCopyWarning
             df.loc[:, 'hour'] = df.index.hour
             df.loc[:, 'day_of_week'] = df.index.dayofweek
             df.loc[:, 'hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
             df.loc[:, 'hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
             df.loc[:, 'day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
             df.loc[:, 'day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
-        else:
-            print("Warning: DataFrame index is not DatetimeIndex, cannot add seasonality features.")
+        else: logger.warning("DataFrame index is not DatetimeIndex, cannot add seasonality features.")
+
+    # --- New Method for Donchian Channel ---
+    def _add_donchian_channel_pta(self, df):
+        """Adds Donchian Channel features using pandas-ta."""
+        # Use lengths defined in __init__
+        lower_len = self.donchian_lower_length
+        upper_len = self.donchian_upper_length
+        df.ta.donchian(lower_length=lower_len, upper_length=upper_len, append=True)
+        # Resulting columns are typically named DCL_lower_upper, DCM_lower_upper, DCU_lower_upper
+        # Example: DCL_240_480, DCM_240_480, DCU_240_480
+
+        # Optional: Add feature for price position within the channel
+        lower_col = f'DCL_{lower_len}_{upper_len}'
+        upper_col = f'DCU_{lower_len}_{upper_len}'
+        if lower_col in df.columns and upper_col in df.columns:
+             channel_range = (df[upper_col] - df[lower_col]).replace(0, np.nan) # Avoid division by zero
+             df.loc[:, f'donchian_pos_{lower_len}_{upper_len}'] = ((df['close'] - df[lower_col]) / channel_range).fillna(0.5) # Fill NaNs with mid-point (0.5)
 
     # --- Update methods remain the same ---
-    def update_tick(self, tick_data):
-        """Passes tick data update to the feature extractor."""
-        self.tick_buffer.append(tick_data)
-
-    def update_order_book(self, order_book):
-        """Passes order book update to the feature extractor."""
-        self.order_book_buffer.append(order_book)
+    def update_tick(self, tick_data): self.tick_buffer.append(tick_data)
+    def update_order_book(self, order_book): self.order_book_buffer.append(order_book)
 
 
 class FeaturePipeline:
@@ -403,17 +299,13 @@ class FeaturePipeline:
     """
     def __init__(self, config=None):
         self.config = config or {}
-        # Pass relevant sub-config down if needed
-        self.feature_extractor = FeatureExtractor(self.config.get('feature_extractor_config', self.config))
-        self.selected_features = [] # Store names of selected features if selection is done
+        self.feature_extractor = FeatureExtractor(self.config.get('feature_config', self.config)) # Pass config down
+        self.selected_features = []
 
     def fit(self, market_data, target=None):
         """Fits the feature extractor's scaler."""
-        print("Fitting FeaturePipeline (pandas-ta)...")
         self.feature_extractor.fit(market_data)
-        # Store feature names available after fitting the scaler
         self.selected_features = self.feature_extractor.feature_names
-        print(f"Pipeline fitted. Using {len(self.selected_features)} numeric features for scaling.")
         return self
 
     def transform(self, raw_features_data):
@@ -422,24 +314,20 @@ class FeaturePipeline:
 
     def save_scaler(self, path):
         """Saves the fitted scaler state via the FeatureExtractor."""
-        self.feature_extractor.save_scaler(path)
+        return self.feature_extractor.save_scaler(path)
 
     def load_scaler(self, path):
         """Loads the scaler state via the FeatureExtractor."""
         self.feature_extractor.load_scaler(path)
+        if self.feature_extractor.is_fitted:
+             self.selected_features = self.feature_extractor.feature_names
 
-    # --- Update methods remain the same ---
-    def update_tick(self, tick_data):
-        """Passes tick data update to the feature extractor."""
-        self.feature_extractor.update_tick(tick_data)
-
-    def update_order_book(self, order_book):
-        """Passes order book update to the feature extractor."""
-        self.feature_extractor.update_order_book(order_book)
+    def update_tick(self, tick_data): self.feature_extractor.update_tick(tick_data)
+    def update_order_book(self, order_book): self.feature_extractor.update_order_book(order_book)
 
 
 # --- Factory Function ---
 def create_feature_pipeline(config):
     """Factory function to create the FeaturePipeline."""
-    feature_config = config.get('feature_config', {})
-    return FeaturePipeline(config=feature_config)
+    feature_config = config.get('feature_config', {}) # Get feature_config section
+    return FeaturePipeline(config=feature_config) # Pass it to the pipeline

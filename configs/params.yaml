@@ -40,7 +40,7 @@ notifications:
   email_password: "jhbv znwi xxop yzyl" # Use App Password for Gmail if 2FA is enabled
   email_smtp_server: "smtp.gmail.com"
   email_smtp_port: 587
-  email_recipient: "tabioye009@gmail.com,tafolabi009@gmail.com,ifeoluwaadegbite15@gmail.com" # Comma-separated list
+  email_recipient: "tabioye009@gmail.com,tafolabi009@gmail.com,ifeoluwaadegbite15@gmail.com,mckaydave200@gmail.com" # Comma-separated list
 
 # --- Data Configuration (data_config) ---
 data_config:
