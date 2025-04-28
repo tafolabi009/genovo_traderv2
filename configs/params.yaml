@@ -1,5 +1,5 @@
 # configs/params.yaml
-# Configuration file for genovo_traderv2 - Updated Symbols & Num Bars
+# Configuration file for genovo_traderv2 - Reduced num_bars
 
 # --- General Settings ---
 mode: 'simulation' # Start with 'simulation' or 'train' first, then switch to 'live' for demo trading
@@ -46,7 +46,7 @@ notifications:
 data_config:
   source: 'mt5'
   timeframe: 'M1'
-  num_bars: 250000 # Increased number of bars
+  num_bars: 50000 # Reduced number of bars drastically as a test
 
 # --- Feature Engineering Configuration (feature_config) ---
 feature_config:
