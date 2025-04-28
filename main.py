@@ -96,7 +96,7 @@ def load_and_clean_data_for_symbols(config, symbols, logger):
     all_data_cleaned = {}
     data_config = config.get('data_config', {})
     timeframe_str = data_config.get('timeframe', 'M1')
-    num_bars = data_config.get('num_bars', 100000) # Default to 100k bars
+    num_bars = data_config.get('num_bars', 50000) # Use the value from config
 
     # Map timeframe string to MT5 constant
     timeframe_map = {
@@ -179,7 +179,8 @@ def load_and_clean_data_for_symbols(config, symbols, logger):
 def run_simulation_or_training(config, logger):
     """
     Runs the trading simulation/training independently for each configured symbol.
-    Saves the fitted scaler state for each symbol after training.
+    Pre-calculates features for efficiency.
+    Saves the fitted scaler state and model for each symbol after training.
     """
     logger.info("--- Starting Multi-Symbol Simulation/Training Mode ---")
     symbols_requested = config.get('symbols', [])
@@ -196,7 +197,6 @@ def run_simulation_or_training(config, logger):
 
     try:
         # Load and clean data using the dedicated function
-        # This now logs available symbols and specific "not found" errors
         all_historical_data = load_and_clean_data_for_symbols(config, symbols_requested, logger)
         if not all_historical_data:
             logger.error("Failed to load data for any requested symbols. Exiting.")
@@ -219,16 +219,64 @@ def run_simulation_or_training(config, logger):
 
     all_results = {}
     errors_occurred = False
-    feature_pipelines = {} # Store fitted pipelines to save scalers
+    # feature_pipelines = {} # No longer needed to store pipelines here
 
-    # Iterate only over symbols for which data was successfully loaded
-    symbols_to_process = list(all_historical_data.keys())
-    logger.info(f"Proceeding with simulation/training for symbols: {symbols_to_process}")
+    # --- Pre-calculate features for all symbols ---
+    all_features_scaled = {}
+    all_feature_pipelines = {} # Store fitted pipelines to save scalers later
+    logger.info("--- Pre-calculating Features for all symbols ---")
+    for symbol, symbol_data in all_historical_data.items():
+        logger.info(f"Calculating features for {symbol} ({len(symbol_data)} bars)...")
+        try:
+            fp = create_feature_pipeline(config.get('feature_config', {}))
+            scaler_path = os.path.join(results_dir, f"{symbol}_scaler.joblib")
+
+            # Load scaler if exists, otherwise fit
+            if os.path.exists(scaler_path):
+                fp.load_scaler(scaler_path)
+                if not fp.feature_extractor.is_fitted:
+                     logger.warning(f"Scaler file found for {symbol} but failed to load correctly. Fitting new scaler.")
+                     fp.fit(symbol_data) # Fit on the whole data
+            else:
+                 logger.info(f"No existing scaler found for {symbol}. Fitting new scaler.")
+                 fp.fit(symbol_data) # Fit on the whole data
+
+            if not fp.feature_extractor.is_fitted:
+                 raise RuntimeError(f"Scaler for {symbol} could not be fitted.")
+
+            # --- IMPORTANT: Calculate features using the extractor directly ---
+            # The transform method now expects pre-calculated features,
+            # so we get the raw features first.
+            raw_features = fp.feature_extractor._extract_all_features(symbol_data)
+            # Now transform (scale) these raw features
+            scaled_features = fp.transform(raw_features) # Pass raw features to transform
+
+            if scaled_features.empty or scaled_features.isnull().values.any():
+                 logger.error(f"Scaled features are empty or contain NaNs for {symbol} after pre-calculation. Skipping symbol.")
+                 errors_occurred = True
+                 continue
+
+            all_features_scaled[symbol] = scaled_features
+            all_feature_pipelines[symbol] = fp # Store the fitted pipeline
+            logger.info(f"Features pre-calculated and scaled for {symbol}. Shape: {scaled_features.shape}")
+
+        except Exception as e:
+            logger.error(f"Error pre-calculating features for {symbol}: {e}", exc_info=True)
+            errors_occurred = True
+            # Continue to next symbol
+
+
+    # --- Run Simulation for symbols with features ---
+    symbols_to_process = list(all_features_scaled.keys())
+    logger.info(f"Proceeding with simulation/training for symbols with features: {symbols_to_process}")
 
     for symbol in symbols_to_process:
         logger.info(f"--- Starting Simulation/Training for {symbol} ---")
-        symbol_data = all_historical_data[symbol]
-        # Create a copy of config for this symbol to avoid cross-contamination of paths etc.
+        # Get the corresponding raw data and pre-calculated features
+        symbol_data_raw = all_historical_data[symbol]
+        symbol_features_scaled = all_features_scaled[symbol]
+
+        # Create a copy of config for this symbol
         symbol_config = config.copy()
         symbol_config['symbol'] = symbol # Add symbol identifier to config
 
@@ -236,43 +284,28 @@ def run_simulation_or_training(config, logger):
         model_cfg = symbol_config.get('model_config', {})
         load_base = model_cfg.get('load_path_base', results_dir)
         save_base = model_cfg.get('save_path_base', results_dir)
-        # Define paths for loading existing model/scaler and saving new ones
-        load_model_path = os.path.join(load_base, f"{symbol}_final_model.pth") # Path to load previous final model
-        save_model_path = os.path.join(save_base, f"{symbol}_final_model.pth") # Path to save final model
-        save_checkpoint_path = os.path.join(save_base, f"{symbol}_checkpoint.pth") # Path for intermediate checkpoints (optional)
+        load_model_path = os.path.join(load_base, f"{symbol}_final_model.pth")
+        save_model_path = os.path.join(save_base, f"{symbol}_final_model.pth")
+        save_checkpoint_path = os.path.join(save_base, f"{symbol}_checkpoint.pth")
         scaler_path = os.path.join(results_dir, f"{symbol}_scaler.joblib") # Path for scaler state
 
         # Update config for the simulator instance
         symbol_config['model_config']['load_path'] = load_model_path if os.path.exists(load_model_path) else None
-        symbol_config['model_config']['save_path'] = save_checkpoint_path # Simulator might save checkpoints
+        symbol_config['model_config']['save_path'] = save_checkpoint_path
 
         simulator = None # Define simulator outside try block
         try:
-            # Create simulator (which initializes features, model, agent, capital manager)
-            simulator = create_simulator(data=symbol_data, config=symbol_config)
-
-            # Load scaler state if it exists
-            if os.path.exists(scaler_path):
-                 simulator.feature_pipeline.load_scaler(scaler_path)
-                 if not simulator.feature_pipeline.feature_extractor.is_fitted:
-                      logger.warning(f"Scaler file found for {symbol} but failed to load correctly. Fitting new scaler.")
-                      # Fit scaler if loading failed
-                      simulator.feature_pipeline.fit(symbol_data)
-            else:
-                 logger.info(f"No existing scaler found for {symbol}. Fitting new scaler.")
-                 # Fit scaler if file doesn't exist
-                 simulator.feature_pipeline.fit(symbol_data)
-
-            # Ensure scaler is fitted before running
-            if not simulator.feature_pipeline.feature_extractor.is_fitted:
-                 raise RuntimeError(f"Scaler for {symbol} could not be fitted.")
-
-            # Store the pipeline instance for saving later
-            feature_pipelines[symbol] = simulator.feature_pipeline
-            logger.info(f"TradingSimulator and FeaturePipeline prepared for {symbol}.")
+            # --- Create Simulator with Pre-calculated Features ---
+            # Pass both raw OHLCV data and the scaled features
+            simulator = create_simulator(
+                data_ohlcv=symbol_data_raw,
+                data_features=symbol_features_scaled,
+                config=symbol_config
+            )
+            logger.info(f"TradingSimulator created for {symbol} using pre-calculated features.")
 
         except Exception as e:
-            logger.error(f"Error creating/preparing TradingSimulator for {symbol}: {e}", exc_info=True)
+            logger.error(f"Error creating TradingSimulator for {symbol}: {e}", exc_info=True)
             errors_occurred = True
             continue # Skip to next symbol
 
@@ -287,12 +320,13 @@ def run_simulation_or_training(config, logger):
             all_results[symbol] = simulator.get_results()
             errors_occurred = True
 
-        # --- Save Scaler State ---
+        # --- Save Scaler State (already fitted and stored in all_feature_pipelines) ---
         try:
-            if symbol in feature_pipelines and feature_pipelines[symbol].feature_extractor.is_fitted:
-                 feature_pipelines[symbol].save_scaler(scaler_path) # Use pipeline's save method
+            if symbol in all_feature_pipelines:
+                 all_feature_pipelines[symbol].save_scaler(scaler_path) # Use pipeline's save method
             else:
-                 logger.warning(f"Scaler for {symbol} was not fitted or pipeline not found. Cannot save scaler state.")
+                 # This shouldn't happen if symbol is in symbols_to_process
+                 logger.warning(f"Pipeline not found for {symbol}. Cannot save scaler state.")
         except Exception as e:
              logger.error(f"Error saving scaler state for {symbol}: {e}", exc_info=True)
              errors_occurred = True
@@ -332,13 +366,14 @@ def run_simulation_or_training(config, logger):
         logger.info(f"--- Finished Simulation/Training for {symbol} ---")
 
     # --- Aggregate Results & Final Notification ---
+    # (Aggregation logic remains the same)
     summary_lines = ["--- Overall Simulation Summary ---"]
     valid_results_count = len(all_results)
     processed_symbols_list = list(all_results.keys())
     summary_lines.append(f"Successfully Processed Symbols: {processed_symbols_list}")
-    symbols_with_data_issues = [s for s in symbols_requested if s not in processed_symbols_list]
-    if symbols_with_data_issues:
-        summary_lines.append(f"Symbols Skipped (Data Issues): {symbols_with_data_issues}")
+    symbols_with_issues = [s for s in symbols_requested if s not in processed_symbols_list]
+    if symbols_with_issues:
+        summary_lines.append(f"Symbols Skipped (Data/Feature Issues): {symbols_with_issues}")
 
 
     if all_results:
@@ -497,6 +532,7 @@ def run_live(config, logger):
 
 
     # --- Live Trading Loop ---
+    # (Live loop logic remains largely the same, but uses pre-loaded components)
     seq_length = config.get('model_config', {}).get('seq_length', 100)
     live_config = config.get('live_config', {})
     loop_interval_sec = live_config.get('loop_interval_sec', 5) # Default 5 seconds
@@ -573,7 +609,12 @@ def run_live(config, logger):
 
                 # 2. Create State Features
                 try:
-                    features_df = fp.transform(current_state_df) # Use the loaded pipeline/scaler
+                    # --- IMPORTANT: Use the Feature Pipeline loaded for this symbol ---
+                    # Calculate raw features first
+                    raw_features = fp.feature_extractor._extract_all_features(current_state_df)
+                    # Scale the raw features using the loaded scaler
+                    features_df = fp.transform(raw_features)
+
                     if features_df.empty or features_df.isnull().values.any():
                          logger.warning(f"Feature transformation returned empty or NaN for {symbol}. Skipping.")
                          continue

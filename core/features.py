@@ -65,13 +65,25 @@ class FeatureExtractor:
 
         # 3. Handle NaNs (Drop rows with any NaNs in numeric columns for fitting)
         initial_len = len(features_numeric)
-        features_cleaned = features_numeric.dropna()
-        dropped_rows = initial_len - len(features_cleaned)
-        if dropped_rows > 0:
-             print(f"Warning: Dropped {dropped_rows} rows with NaNs before fitting scaler.")
+        # Fill NaNs before fitting instead of dropping rows to keep data length consistent
+        features_filled = features_numeric.ffill().bfill()
+        # Check if any NaNs remain (e.g., if the entire column was NaN initially)
+        cols_with_nans = features_filled.columns[features_filled.isnull().any()].tolist()
+        if cols_with_nans:
+             print(f"Warning: Columns still contain NaNs after filling: {cols_with_nans}. Dropping these columns for fitting.")
+             features_cleaned = features_filled.drop(columns=cols_with_nans)
+        else:
+             features_cleaned = features_filled
+
+        # Drop columns with zero variance (constant columns) before fitting
+        cols_to_drop = features_cleaned.columns[features_cleaned.var() == 0]
+        if not cols_to_drop.empty:
+             print(f"Warning: Dropping constant columns before fitting scaler: {cols_to_drop.tolist()}")
+             features_cleaned = features_cleaned.drop(columns=cols_to_drop)
+
 
         if features_cleaned.empty:
-            print("Warning: No valid numeric features remaining after cleaning. Scaler not fitted.")
+            print("Warning: No valid numeric features remaining after cleaning/dropping constant columns. Scaler not fitted.")
             self.is_fitted = False
             return self
 
@@ -93,61 +105,72 @@ class FeatureExtractor:
 
         return self
 
-    def transform(self, market_data):
+    def transform(self, raw_features_data):
         """
-        Transforms new market data into a scaled feature matrix using the fitted scaler.
-        Handles missing columns and potential NaN/inf values robustly.
+        Transforms pre-calculated raw features into a scaled feature matrix
+        using the fitted scaler. Handles missing columns and potential NaN/inf values robustly.
+
+        Args:
+            raw_features_data (pd.DataFrame): DataFrame containing pre-calculated,
+                                              but **unscaled**, features.
+
+        Returns:
+            pd.DataFrame: Scaled feature DataFrame.
         """
         if not self.is_fitted:
-            print("Warning: Scaler not fitted. Returning unscaled features.")
-            # Still extract features, but don't scale
-            features = self._extract_all_features(market_data)
-            # Basic cleaning of raw features before returning
-            features = features.replace([np.inf, -np.inf], np.nan)
-            # Forward fill NaNs in the unscaled output for model compatibility
-            features = features.ffill().bfill()
-            return features.select_dtypes(include=np.number) # Return only numeric
+            print("Error: Scaler not fitted. Cannot transform features.")
+            # Return empty DataFrame with expected columns if possible
+            return pd.DataFrame(columns=self.feature_names)
 
-        if market_data is None or market_data.empty:
-             print("Warning: Empty market data provided for transform.")
+        if raw_features_data is None or raw_features_data.empty:
+             print("Warning: Empty raw features data provided for transform.")
              # Return empty DataFrame with expected columns if possible
              return pd.DataFrame(columns=self.feature_names)
 
-        # 1. Extract raw features
-        features = self._extract_all_features(market_data)
+        features = raw_features_data.copy() # Work on a copy
 
-        # 2. Select only the features the scaler was trained on
-        cols_to_scale = [col for col in self.feature_names if col in features.columns]
-        missing_cols = [col for col in self.feature_names if col not in features.columns]
+        # 1. Select only the features the scaler was trained on
+        #    Also, ensure the order of columns matches the scaler's expectations
+        cols_to_scale = []
+        missing_cols = []
+        extra_cols = list(features.columns) # Start with all columns in input
+
+        for col in self.feature_names: # Iterate through columns scaler expects
+            if col in features.columns:
+                cols_to_scale.append(col)
+                if col in extra_cols: extra_cols.remove(col) # Remove found columns from extras
+            else:
+                missing_cols.append(col) # Scaler expected this, but it's missing
+
         if missing_cols:
-             print(f"Warning: Features missing during transform (were present during fit): {missing_cols}")
+             print(f"Warning: Features missing during transform (needed by scaler): {missing_cols}. They will be added and filled with 0.")
+        if extra_cols:
+             print(f"Warning: Extra features found during transform (not used by scaler): {extra_cols}. They will be dropped.")
 
         if not cols_to_scale:
              print("Warning: No features available to scale matching the fitted scaler.")
-             # Return empty DataFrame with expected columns
-             return pd.DataFrame(columns=self.feature_names)
+             # Return DataFrame with expected columns filled with 0
+             return pd.DataFrame(0, index=features.index, columns=self.feature_names)
 
+        # Select only the columns to be scaled, in the correct order
         features_to_scale_df = features[cols_to_scale]
 
-        # 3. Clean features before scaling (handle inf/NaN)
+        # 2. Clean features before scaling (handle inf/NaN)
         features_to_scale_df = features_to_scale_df.replace([np.inf, -np.inf], np.nan)
-        # Fill NaNs *before* scaling (e.g., forward fill) - crucial!
-        # Use ffill then bfill to handle NaNs at the beginning/end
+        # Fill NaNs *before* scaling (e.g., forward fill then backward fill)
         features_filled = features_to_scale_df.ffill().bfill()
 
-        # Check if any NaNs remain after filling (shouldn't happen with ffill/bfill unless all are NaN)
+        # Check if any NaNs remain after filling (e.g., if a whole column was NaN)
         if features_filled.isnull().values.any():
-             print("Warning: NaNs still present after ffill/bfill before scaling. Check input data.")
-             # Decide on handling: drop rows, return empty, or try scaling anyway?
-             # Returning empty might be safest if NaNs persist unexpectedly.
-             return pd.DataFrame(columns=self.feature_names)
+             print("Warning: NaNs still present after ffill/bfill before scaling. Filling remaining NaNs with 0.")
+             features_filled.fillna(0, inplace=True) # Fill remaining with 0
 
         try:
-             # 4. Scale the cleaned and filled data
+             # 3. Scale the cleaned and filled data
              scaled_array = self.scaler.transform(features_filled)
              scaled_features = pd.DataFrame(scaled_array, index=features_filled.index, columns=cols_to_scale)
 
-             # 5. Reintroduce any missing fitted columns filled with zeros (or mean/median)
+             # 4. Reintroduce any missing fitted columns filled with zeros (or mean/median)
              # This ensures the output always has the columns the model expects
              if missing_cols:
                   for col in missing_cols:
@@ -165,6 +188,7 @@ class FeatureExtractor:
              print(f"Unexpected error during feature transformation: {e}")
              return pd.DataFrame(columns=self.feature_names) # Return empty on error
 
+    # --- save_scaler, load_scaler, _extract_all_features, and _add_* methods remain the same ---
     def save_scaler(self, path):
         """Saves the fitted scaler and feature names to a file using joblib."""
         if self.is_fitted:
@@ -207,19 +231,12 @@ class FeatureExtractor:
         """Internal method to orchestrate feature extraction using pandas-ta."""
         df = market_data.copy()
         required_cols = ['open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required_cols):
-            # Try converting to lowercase if columns exist but case is wrong
-            df.columns = df.columns.str.lower()
-            if not all(col in df.columns for col in required_cols):
-                 raise ValueError(f"Market data must contain columns: {required_cols}")
-
-        # Ensure columns are lowercase for pandas-ta compatibility
+        # Standardize column names to lowercase at the beginning
         df.columns = df.columns.str.lower()
+        if not all(col in df.columns for col in required_cols):
+            raise ValueError(f"Market data must contain columns: {required_cols}")
 
         # --- Use pandas-ta Strategy or individual indicators ---
-        # Consider using a try-except block for each group or indicator
-        # if specific ones are prone to errors with certain data.
-
         try: self._add_price_features_pta(df)
         except Exception as e: print(f"Error adding price features: {e}")
 
@@ -252,7 +269,6 @@ class FeatureExtractor:
 
     # --- Individual Feature Group Methods using pandas-ta ---
     # (Keep these methods as they were, they use pandas-ta correctly)
-
     def _add_price_features_pta(self, df):
         """Adds price-based features using pandas-ta."""
         df.ta.log_return(cumulative=False, append=True) # Adds 'LOGRET_1'
@@ -335,7 +351,7 @@ class FeatureExtractor:
             rolling_std = df[log_returns_col].rolling(window=window).std()
             # Avoid division by zero or near-zero std dev
             rolling_std = rolling_std.replace(0, np.nan) # Replace 0 std with NaN
-            df[f'roll_zscore_{window}'] = ((df[log_returns_col] - rolling_mean) / rolling_std).fillna(0) # Fill resulting NaNs with 0
+            df.loc[:, f'roll_zscore_{window}'] = ((df[log_returns_col] - rolling_mean) / rolling_std).fillna(0) # Fill resulting NaNs with 0
 
     def _add_volatility_features_pta(self, df):
         """Adds volatility features using pandas-ta."""
@@ -346,8 +362,8 @@ class FeatureExtractor:
         abs_log_returns = np.abs(log_returns)
         for window in self.window_sizes:
              if window <= 1: continue
-             df[f'abs_ret_ma_{window}'] = abs_log_returns.rolling(window=window).mean()
-             df[f'vol_of_vol_{window}'] = abs_log_returns.rolling(window=window).std().fillna(0) # Fill NaN std dev
+             df.loc[:, f'abs_ret_ma_{window}'] = abs_log_returns.rolling(window=window).mean()
+             df.loc[:, f'vol_of_vol_{window}'] = abs_log_returns.rolling(window=window).std().fillna(0) # Fill NaN std dev
 
     def _add_trend_features_pta(self, df):
         """Adds trend detection features using pandas-ta."""
@@ -400,9 +416,9 @@ class FeaturePipeline:
         print(f"Pipeline fitted. Using {len(self.selected_features)} numeric features for scaling.")
         return self
 
-    def transform(self, market_data):
-        """Transforms data using the fitted feature extractor."""
-        return self.feature_extractor.transform(market_data)
+    def transform(self, raw_features_data):
+        """Transforms pre-calculated raw features using the fitted feature extractor."""
+        return self.feature_extractor.transform(raw_features_data)
 
     def save_scaler(self, path):
         """Saves the fitted scaler state via the FeatureExtractor."""
@@ -427,4 +443,3 @@ def create_feature_pipeline(config):
     """Factory function to create the FeaturePipeline."""
     feature_config = config.get('feature_config', {})
     return FeaturePipeline(config=feature_config)
-
