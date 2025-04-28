@@ -46,7 +46,7 @@ notifications:
 data_config:
   source: 'mt5'
   timeframe: 'M1'
-  num_bars: 50000 # Keep reduced number of bars for now
+  num_bars: 100000 # Keep reduced number of bars for now
 
 # --- Feature Engineering Configuration (feature_config) ---
 feature_config:
