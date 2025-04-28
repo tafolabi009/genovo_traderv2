@@ -7,6 +7,9 @@ from torch.distributions import Categorical
 import numpy as np
 from collections import deque
 import math
+import logging # Import logging
+
+logger = logging.getLogger("genovo_traderv2") # Get logger
 
 # Assuming EnhancedTradingModel is in core.model and can be imported
 # from core.model import EnhancedTradingModel
@@ -64,38 +67,15 @@ class PPOAgent:
 
     def _get_default_reward_config(self):
         """Provides default parameters for the reward function."""
+        # (Keep default config the same)
         return {
-            # PnL Scaling & Asymmetry
-            'pnl_scale': 100.0,           # Multiplier for raw PnL
-            'profit_bonus_factor': 1.2,   # Extra bonus for positive PnL
-            'loss_penalty_factor': 1.5,   # Extra penalty for negative PnL (loss aversion)
-
-            # Risk Management Penalties
-            'max_loss_penalty': -50.0,    # Large penalty if a trade hits max stop loss %
-            'uncertainty_penalty_factor': 0.5, # Penalty scaled by model uncertainty
-            'high_volatility_penalty_factor': 0.3, # Penalty scaled by model volatility prediction
-
-            # Regime-Based Rewards/Penalties (Assuming 0: Trend, 1: MeanRev, 2: Uncertain)
-            'trend_follow_bonus': 0.1,    # Bonus for acting WITH predicted trend
-            'mean_revert_bonus': 0.1,     # Bonus for acting counter-trend in MeanRev regime
-            'trend_against_penalty': -0.2,# Penalty for acting AGAINST predicted trend
-            'mean_revert_against_penalty': -0.2, # Penalty for acting trend-like in MeanRev regime
-            'uncertain_regime_penalty': -0.1, # Penalty for taking aggressive actions in uncertain regime
-
-            # Trade Duration & Efficiency
-            'holding_penalty_factor': -0.001, # Small penalty per step holding a position
-            'profit_capture_bonus': 0.5,  # Bonus for closing a profitable trade
-            'quick_profit_bonus_factor': 0.2, # Extra bonus if profit target hit quickly (vs. model horizon)
-
-            # Consistency (Proxy)
-            'sharpe_ratio_bonus_factor': 0.05, # Bonus scaled by recent reward std dev (proxy)
-
-            # Catastrophic Event Handling
-            'catastrophic_threshold': -20.0, # Reward level considered catastrophic
-            'catastrophic_repeat_penalty': -10.0, # Penalty for taking same action after recent catastrophe
-
-            # Action Penalties (e.g., for over-trading)
-            'transaction_cost_penalty': -0.01 # Simple penalty per Buy/Sell action
+            'pnl_scale': 100.0, 'profit_bonus_factor': 1.2, 'loss_penalty_factor': 1.5,
+            'max_loss_penalty': -50.0, 'uncertainty_penalty_factor': 0.5, 'high_volatility_penalty_factor': 0.3,
+            'trend_follow_bonus': 0.1, 'mean_revert_bonus': 0.1, 'trend_against_penalty': -0.2,
+            'mean_revert_against_penalty': -0.2, 'uncertain_regime_penalty': -0.1,
+            'holding_penalty_factor': -0.001, 'profit_capture_bonus': 0.5, 'quick_profit_bonus_factor': 0.2,
+            'sharpe_ratio_bonus_factor': 0.05, 'catastrophic_threshold': -20.0,
+            'catastrophic_repeat_penalty': -10.0, 'transaction_cost_penalty': -0.01
         }
 
     def select_action(self, state):
@@ -112,15 +92,26 @@ class PPOAgent:
         """
         if not isinstance(state, torch.Tensor):
             # Assuming state is a numpy array [seq_len, num_features]
-            state = torch.FloatTensor(state).unsqueeze(0) # Add batch dimension
+             state_tensor = torch.FloatTensor(state).unsqueeze(0) # Add batch dimension
         elif state.dim() == 2:
             # Add batch dimension if it's [seq_len, num_features]
-             state = state.unsqueeze(0)
+             state_tensor = state.unsqueeze(0)
+        else:
+             state_tensor = state # Assume already has batch dim
 
-        # Ensure model is in evaluation mode for action selection
+        # Ensure model is on the correct device and in eval mode
+        device = next(self.model.parameters()).device
+        state_tensor = state_tensor.to(device)
         self.model.eval()
+
         with torch.no_grad():
-            outputs = self.model(state) # Get all outputs from EnhancedTradingModel
+            try:
+                outputs = self.model(state_tensor) # Get all outputs from EnhancedTradingModel
+            except Exception as e:
+                 logger.error(f"Error during model forward pass in select_action: {e}", exc_info=True)
+                 # Handle error: maybe return default action (Hold) or re-raise
+                 # Returning default action might hide underlying issues. Re-raising is safer.
+                 raise e # Re-raise the exception
 
         # Extract necessary outputs
         policy_logits = outputs['policy_logits']
@@ -140,21 +131,19 @@ class PPOAgent:
         log_prob = dist.log_prob(action)
 
         # Package state info for reward calculation
+        # Convert tensors to CPU numpy arrays or scalars for storage/use outside PyTorch graph
         state_info = {
             'value': value.item(),
             'position_size_suggestion': position_size.item(),
             'uncertainty': uncertainty.item(),
-            'regime_logits': regime_logits.cpu().numpy(), # Store numpy array
+            'regime_logits': regime_logits.cpu().numpy().flatten(), # Store numpy array
             'volatility': volatility.item(),
             'stop_loss_suggestion': sl_suggestion.item(),
             'take_profit_suggestion': tp_suggestion.item(),
             'trade_horizon_suggestion': horizon_suggestion.item(),
-            # Add raw policy logits/probs if needed for analysis
-            'policy_probs': action_probs.cpu().numpy()
+            'policy_probs': action_probs.cpu().numpy().flatten() # Store numpy array
         }
 
-        # Note: Actual position size might be adjusted by compounding/risk logic later
-        # The action here is Buy/Sell/Hold (e.g., 1/2/0)
         return (action.item(), log_prob.item(), value.item(),
                 position_size.item(), uncertainty.item(), state_info)
 
@@ -195,7 +184,8 @@ class PPOAgent:
             with torch.no_grad():
                  # Pass state to model to get value prediction
                  # Ensure state is on the correct device if using GPU
-                 last_state = last_state.to(next(self.model.parameters()).device)
+                 device = next(self.model.parameters()).device
+                 last_state = last_state.to(device)
                  next_value = self.model(last_state)['value'].cpu().detach()
         else:
             next_value = torch.zeros(1, 1) # Terminal state has zero value
@@ -229,7 +219,10 @@ class PPOAgent:
     def update(self):
         """Performs the PPO update step."""
         if not self.memory['rewards']: # Check if memory is empty
-             print("Memory is empty, skipping PPO update.")
+             # logger.debug("Memory is empty, skipping PPO update.")
+             return
+        if len(self.memory['rewards']) < self.batch_size:
+             # logger.debug(f"Not enough samples ({len(self.memory['rewards'])} < {self.batch_size}) for PPO update.")
              return
 
         # Calculate advantages and returns first
@@ -256,8 +249,9 @@ class PPOAgent:
             np.random.shuffle(indices)
             for start in range(0, n_samples, self.batch_size):
                 end = start + self.batch_size
-                if end > n_samples: # Avoid partial batch if smaller than batch_size
-                    continue
+                # Ensure we have a full batch
+                if end > n_samples:
+                    continue # Skip partial batch at the end
                 batch_indices = indices[start:end]
 
                 # Get minibatch data and move to device
@@ -318,7 +312,8 @@ class PPOAgent:
         Args:
             pnl (float): Profit and loss since the last step.
             action (int): Action taken (e.g., 0:Hold, 1:Buy, 2:Sell).
-            state_info (dict): Outputs from the EnhancedTradingModel for the current state.
+            state_info (dict): Outputs from the EnhancedTradingModel for the current state
+                               (expected to contain numpy arrays/scalars).
             environment_info (dict): Additional info from the environment/simulator.
                                      Expected keys: 'is_trade_closed', 'hit_stop_loss',
                                      'steps_in_trade', 'current_price', 'entry_price'.
@@ -345,17 +340,25 @@ class PPOAgent:
         reward -= state_info.get('volatility', 0) * cfg['high_volatility_penalty_factor']
 
         # --- 3. Regime-Aware Rewards/Penalties ---
-        regime_probs = torch.softmax(torch.tensor(state_info.get('regime_logits', [0,0,0])), dim=-1)
-        predicted_regime = torch.argmax(regime_probs).item() # 0:Trend, 1:MeanRev, 2:Uncertain
+        # Ensure regime_logits are handled correctly (should be numpy array from state_info)
+        regime_logits_np = state_info.get('regime_logits', np.array([0.0, 0.0, 0.0])) # Default if missing
+        try:
+            # --- !! FIX HERE: Ensure tensor is float !! ---
+            regime_logits_tensor = torch.tensor(regime_logits_np, dtype=torch.float32)
+            regime_probs = torch.softmax(regime_logits_tensor, dim=-1)
+            predicted_regime = torch.argmax(regime_probs).item() # 0:Trend, 1:MeanRev, 2:Uncertain
+        except Exception as e:
+            logger.error(f"Error processing regime_logits in reward calculation: {e}. Logits: {regime_logits_np}", exc_info=True)
+            predicted_regime = 2 # Default to uncertain regime on error
+
 
         # Assuming action 1=Buy, 2=Sell, 0=Hold
         is_buy = action == 1
         is_sell = action == 2
         is_aggressive = is_buy or is_sell
 
-        # Get simple trend direction (e.g., from a moving average feature if available,
-        # or potentially infer from model if trained for it - simplified here)
-        # Placeholder: Assume a simple trend indicator is available or calculated
+        # Get simple trend direction (e.g., from a moving average feature if available)
+        # This needs to be passed in environment_info if used
         trend_direction = environment_info.get('trend_direction', 0) # 1=Up, -1=Down, 0=Neutral
 
         if predicted_regime == 0: # Trending
@@ -365,7 +368,6 @@ class PPOAgent:
                 reward += cfg['trend_against_penalty']
         elif predicted_regime == 1: # Mean Reverting
              # Reward fading moves (selling highs, buying lows - needs price context)
-             # Simplified: Reward acting against recent trend
             if (is_buy and trend_direction == -1) or (is_sell and trend_direction == 1):
                  reward += cfg['mean_revert_bonus']
             elif (is_buy and trend_direction == 1) or (is_sell and trend_direction == -1):
@@ -378,7 +380,7 @@ class PPOAgent:
         if environment_info.get('is_in_trade', False):
             reward += cfg['holding_penalty_factor'] * environment_info.get('steps_in_trade', 0)
 
-        if environment_info.get('is_trade_closed', False) and pnl > 0:
+        if environment_info.get('is_trade_closed', False) and pnl > 0: # Only bonus if closed profitably
             reward += cfg['profit_capture_bonus']
             # Optional: Bonus for hitting profit target faster than model predicted
             # horizon = state_info.get('trade_horizon_suggestion', 100)
@@ -389,21 +391,16 @@ class PPOAgent:
         # --- 5. Consistency (Proxy using recent reward volatility) ---
         if len(self.recent_rewards) > 10: # Need enough samples
              reward_std = np.std(list(self.recent_rewards))
-             # Penalize high reward volatility (encourage smooth equity curve)
-             # Avoid division by zero
-             if reward_std > 1e-6:
-                  # Simple Sharpe proxy: reward mean / reward std
-                  # We use the inverse of std dev as a bonus factor if positive mean reward
+             if reward_std > 1e-6: # Avoid division by zero
                   mean_reward = np.mean(list(self.recent_rewards))
+                  # Sharpe proxy bonus (only if mean reward is positive)
                   if mean_reward > 0:
                        reward += (mean_reward / reward_std) * cfg['sharpe_ratio_bonus_factor']
 
 
         # --- 6. Catastrophic Event Handling ---
-        # Check if the current action matches an action that recently led to a catastrophe
         for past_reward, past_action, past_state_info in self.catastrophic_memory:
              if action == past_action and is_aggressive: # Penalize repeating aggressive actions
-                  # Optional: Add more complex check (e.g., if state is similar)
                   reward += cfg['catastrophic_repeat_penalty']
                   break # Apply penalty only once
 
@@ -419,14 +416,23 @@ class PPOAgent:
 
     def save_model(self, path):
         """Saves the model state."""
-        torch.save(self.model.state_dict(), path)
-        print(f"Model saved to {path}")
+        try:
+            torch.save(self.model.state_dict(), path)
+            # logger.info(f"Model saved to {path}") # Logging moved to main.py
+        except Exception as e:
+             logger.error(f"Error saving model to {path}: {e}", exc_info=True)
+
 
     def load_model(self, path, device='cpu'):
         """Loads the model state."""
-        self.model.load_state_dict(torch.load(path, map_location=device))
-        self.model.to(device) # Ensure model is on the correct device
-        print(f"Model loaded from {path} to device {device}")
+        try:
+            self.model.load_state_dict(torch.load(path, map_location=device))
+            self.model.to(device) # Ensure model is on the correct device
+            self.model.eval() # Set to evaluation mode after loading
+            logger.info(f"Model loaded from {path} to device {device}")
+        except Exception as e:
+             logger.error(f"Error loading model from {path}: {e}", exc_info=True)
+
 
 # --- Helper Function ---
 def create_strategy(model, config):
@@ -441,10 +447,11 @@ def create_strategy(model, config):
         PPOAgent: The configured PPO agent.
     """
     # Ensure reward config is nested correctly if passed within main config
-    agent_config = config.get('agent_config', {})
-    reward_config = config.get('reward_config', {})
-    # Merge if reward_config is provided separately at top level
-    agent_config['reward_config'] = {**agent_config.get('reward_config', {}), **reward_config}
+    agent_config = config # Expect agent_config directly now
+    reward_config = agent_config.get('reward_config', {}) # Get reward config if nested
+
+    # Merge if reward_config is provided separately at top level (less likely now)
+    # agent_config['reward_config'] = {**agent_config.get('reward_config', {}), **reward_config}
 
 
     return PPOAgent(
@@ -457,5 +464,6 @@ def create_strategy(model, config):
         batch_size=agent_config.get('batch_size', 64),
         entropy_coef=agent_config.get('entropy_coef', 0.01),
         value_loss_coef=agent_config.get('value_loss_coef', 0.5),
-        config=agent_config # Pass the combined agent configuration
+        config=agent_config # Pass the agent configuration (which includes reward_config)
     )
+

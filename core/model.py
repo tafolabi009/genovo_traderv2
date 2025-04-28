@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import logging # Import logging
+
+logger = logging.getLogger("genovo_traderv2") # Get logger
 
 class TCNBlock(nn.Module):
     """
@@ -157,13 +160,14 @@ class EnhancedTradingModel(nn.Module):
                  dropout=0.2):
         super(EnhancedTradingModel, self).__init__()
 
+        # --- !! Add Logging Here !! ---
+        logger.info(f"Initializing EnhancedTradingModel with num_features = {num_features}")
+        # --- End Logging ---
+
         self.hidden_size = hidden_size
 
         # --- Input Layer ---
-        # Optional: Linear layer to project input features to hidden_size
-        # self.input_proj = nn.Linear(num_features, hidden_size)
-        # self.layer_norm_input = nn.LayerNorm(hidden_size)
-        # Or directly use LayerNorm on input features if TCN handles projection
+        # LayerNorm on input features
         self.layer_norm_input = nn.LayerNorm(num_features)
         tcn_input_channels = num_features # Input to TCN is original features
 
@@ -277,42 +281,65 @@ class EnhancedTradingModel(nn.Module):
         # x shape: [batch_size, seq_len, num_features]
 
         # 1. Input Layer Normalization
-        x = self.layer_norm_input(x)
+        try:
+            x = self.layer_norm_input(x)
+        except Exception as e:
+             logger.error(f"Error in layer_norm_input: {e}. Input shape: {x.shape}", exc_info=True)
+             raise # Re-raise the exception after logging
 
         # 2. TCN Layers
         # Reshape for Conv1d: [batch_size, num_features, seq_len]
         x = x.transpose(1, 2)
-        for tcn_layer in self.tcn_layers:
-            x = tcn_layer(x)
+        for i, tcn_layer in enumerate(self.tcn_layers):
+            try:
+                x = tcn_layer(x)
+            except Exception as e:
+                logger.error(f"Error in TCN layer {i}: {e}. Input shape: {x.shape}", exc_info=True)
+                raise
         # Reshape back: [batch_size, seq_len, tcn_output_channels]
         x = x.transpose(1, 2)
 
         # 3. GRU Layer
-        # gru_output shape: [batch_size, seq_len, hidden_size]
-        # hidden shape: [num_layers, batch_size, hidden_size]
-        gru_output, hidden = self.gru(x)
+        try:
+            gru_output, hidden = self.gru(x)
+        except Exception as e:
+            logger.error(f"Error in GRU layer: {e}. Input shape: {x.shape}", exc_info=True)
+            raise
 
         # 4. Transformer Encoder Layers
         transformer_output = gru_output # Input to transformer is GRU output sequence
-        for transformer_layer in self.transformer_layers:
-            # Masking usually not needed for encoder-only structure on full sequence
-            transformer_output = transformer_layer(transformer_output)
-        transformer_output = self.final_norm(transformer_output)
+        for i, transformer_layer in enumerate(self.transformer_layers):
+            try:
+                # Masking usually not needed for encoder-only structure on full sequence
+                transformer_output = transformer_layer(transformer_output)
+            except Exception as e:
+                 logger.error(f"Error in Transformer layer {i}: {e}. Input shape: {transformer_output.shape}", exc_info=True)
+                 raise
+        try:
+             transformer_output = self.final_norm(transformer_output)
+        except Exception as e:
+             logger.error(f"Error in final_norm: {e}. Input shape: {transformer_output.shape}", exc_info=True)
+             raise
+
 
         # 5. Extract Last Time Step Output for Heads
         # Use the output from the transformer's last time step
         last_step_output = transformer_output[:, -1, :] # Shape: [batch_size, hidden_size]
 
         # 6. Calculate Outputs from Heads
-        policy_logits = self.policy_head(last_step_output)
-        value = self.value_head(last_step_output)
-        position_size = self.position_size_head(last_step_output)
-        uncertainty = self.uncertainty_head(last_step_output)
-        stop_loss = self.stop_loss_head(last_step_output)
-        take_profit = self.take_profit_head(last_step_output)
-        trade_horizon = self.trade_horizon_head(last_step_output)
-        regime_logits = self.regime_detection_head(last_step_output)
-        volatility = self.volatility_prediction_head(last_step_output)
+        try:
+            policy_logits = self.policy_head(last_step_output)
+            value = self.value_head(last_step_output)
+            position_size = self.position_size_head(last_step_output)
+            uncertainty = self.uncertainty_head(last_step_output)
+            stop_loss = self.stop_loss_head(last_step_output)
+            take_profit = self.take_profit_head(last_step_output)
+            trade_horizon = self.trade_horizon_head(last_step_output)
+            regime_logits = self.regime_detection_head(last_step_output)
+            volatility = self.volatility_prediction_head(last_step_output)
+        except Exception as e:
+             logger.error(f"Error calculating output heads: {e}. Input shape: {last_step_output.shape}", exc_info=True)
+             raise
 
         # Return all outputs in a dictionary
         return {
@@ -345,10 +372,21 @@ def create_model(config):
     Returns:
         EnhancedTradingModel: The instantiated trading model.
     """
-    model_config = config.get('model_config', {}) # Expect nested config
+    model_config = config # Expect model_config directly now
+    num_features = model_config.get('num_features')
+    if num_features is None:
+         # Attempt to get from feature_config if model_config is missing it
+         # This is a fallback, ideally num_features is set correctly in model_config
+         logger.warning("num_features not found in model_config, trying feature_config (this might be incorrect).")
+         # Need access to the full config here, which might not be available.
+         # Best practice: Ensure num_features is correctly set in model_config in main.py
+         # Forcing a default or raising error might be better.
+         raise ValueError("num_features is missing in model_config.")
+
+
     return EnhancedTradingModel(
-        num_features=model_config.get('num_features', 50), # Default based on feature config
-        seq_length=model_config.get('seq_length', 100),
+        num_features=num_features, # Use the determined num_features
+        seq_length=model_config.get('seq_length', 201), # Use updated default
         hidden_size=model_config.get('hidden_size', 128),
         num_layers=model_config.get('num_layers', 2),
         tcn_channels=model_config.get('tcn_channels', [64, 128, 128]),

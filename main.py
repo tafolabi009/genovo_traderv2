@@ -220,8 +220,6 @@ def run_simulation_or_training(config, logger):
     all_results = {}
     errors_occurred = False
     # feature_pipelines = {} # No longer needed to store pipelines here
-
-    # --- Pre-calculate features for all symbols ---
     all_features_scaled = {}
     all_feature_pipelines = {} # Store fitted pipelines to save scalers later
     logger.info("--- Pre-calculating Features for all symbols ---")
@@ -244,9 +242,7 @@ def run_simulation_or_training(config, logger):
             if not fp.feature_extractor.is_fitted:
                  raise RuntimeError(f"Scaler for {symbol} could not be fitted.")
 
-            # --- IMPORTANT: Calculate features using the extractor directly ---
-            # The transform method now expects pre-calculated features,
-            # so we get the raw features first.
+            # Calculate raw features first
             raw_features = fp.feature_extractor._extract_all_features(symbol_data)
             # Now transform (scale) these raw features
             scaled_features = fp.transform(raw_features) # Pass raw features to transform
@@ -293,10 +289,15 @@ def run_simulation_or_training(config, logger):
         symbol_config['model_config']['load_path'] = load_model_path if os.path.exists(load_model_path) else None
         symbol_config['model_config']['save_path'] = save_checkpoint_path
 
+        # Ensure num_features is correct in the config passed to the simulator
+        if 'model_config' not in symbol_config: symbol_config['model_config'] = {}
+        symbol_config['model_config']['num_features'] = symbol_features_scaled.shape[1]
+
+
         simulator = None # Define simulator outside try block
+        results = None # Initialize results to None *** FIX HERE ***
         try:
             # --- Create Simulator with Pre-calculated Features ---
-            # Pass both raw OHLCV data and the scaled features
             simulator = create_simulator(
                 data_ohlcv=symbol_data_raw,
                 data_features=symbol_features_scaled,
@@ -304,28 +305,27 @@ def run_simulation_or_training(config, logger):
             )
             logger.info(f"TradingSimulator created for {symbol} using pre-calculated features.")
 
-        except Exception as e:
-            logger.error(f"Error creating TradingSimulator for {symbol}: {e}", exc_info=True)
-            errors_occurred = True
-            continue # Skip to next symbol
-
-        # --- Run Simulation ---
-        try:
+            # --- Run Simulation ---
             results = simulator.run() # run() now returns results dictionary
             all_results[symbol] = results
             logger.info(f"Simulation run completed for {symbol}.")
+
         except Exception as e:
-            logger.error(f"Error during simulation run for {symbol}: {e}", exc_info=True)
-            # Try to get partial results if run failed mid-way
-            all_results[symbol] = simulator.get_results()
+            logger.error(f"Error creating or running TradingSimulator for {symbol}: {e}", exc_info=True)
             errors_occurred = True
+            # Try to get partial results if simulator exists and run failed mid-way
+            if simulator:
+                 all_results[symbol] = simulator.get_results() # Assign partial results
+            else:
+                 all_results[symbol] = {} # Assign empty dict if simulator creation failed
+            continue # Skip to next symbol
+
 
         # --- Save Scaler State (already fitted and stored in all_feature_pipelines) ---
         try:
             if symbol in all_feature_pipelines:
                  all_feature_pipelines[symbol].save_scaler(scaler_path) # Use pipeline's save method
             else:
-                 # This shouldn't happen if symbol is in symbols_to_process
                  logger.warning(f"Pipeline not found for {symbol}. Cannot save scaler state.")
         except Exception as e:
              logger.error(f"Error saving scaler state for {symbol}: {e}", exc_info=True)
@@ -333,13 +333,17 @@ def run_simulation_or_training(config, logger):
 
         # --- Save Results History ---
         try:
-            history_df = results.get('history')
-            if history_df is not None and not history_df.empty:
-                history_path = os.path.join(results_dir, f"{symbol}_history.csv")
-                history_df.to_csv(history_path)
-                logger.info(f"Simulation history saved for {symbol} to {history_path}")
-            elif not errors_occurred: # Don't warn if run failed anyway
-                 logger.warning(f"Simulation history empty/missing for {symbol}.")
+            # Check if results is not None before accessing
+            if results is not None:
+                history_df = results.get('history')
+                if history_df is not None and not history_df.empty:
+                    history_path = os.path.join(results_dir, f"{symbol}_history.csv")
+                    history_df.to_csv(history_path)
+                    logger.info(f"Simulation history saved for {symbol} to {history_path}")
+                elif not errors_occurred:
+                     logger.warning(f"Simulation history empty/missing for {symbol}.")
+            else:
+                 logger.warning(f"Simulation results object is None for {symbol}, cannot save history.")
         except Exception as e:
             logger.error(f"Error saving history for {symbol}: {e}", exc_info=True); errors_occurred = True
 
@@ -356,10 +360,11 @@ def run_simulation_or_training(config, logger):
         # --- Plot Results ---
         if symbol_config.get('simulator_config', {}).get('plot_results', False):
             try:
-                if hasattr(simulator, 'plot_results') and results.get('history') is not None and not results['history'].empty:
+                # Check if results is not None before accessing
+                if results is not None and hasattr(simulator, 'plot_results') and results.get('history') is not None and not results['history'].empty:
                      simulator.plot_results(results); logger.info(f"Results plotted for {symbol}.")
                 elif not errors_occurred:
-                     logger.warning(f"Cannot plot results for {symbol} - simulator or history missing/empty.")
+                     logger.warning(f"Cannot plot results for {symbol} - simulator or history missing/empty or results object is None.")
             except Exception as e:
                  logger.error(f"Could not plot results for {symbol}: {e}", exc_info=True)
 
@@ -373,14 +378,15 @@ def run_simulation_or_training(config, logger):
     summary_lines.append(f"Successfully Processed Symbols: {processed_symbols_list}")
     symbols_with_issues = [s for s in symbols_requested if s not in processed_symbols_list]
     if symbols_with_issues:
-        summary_lines.append(f"Symbols Skipped (Data/Feature Issues): {symbols_with_issues}")
+        summary_lines.append(f"Symbols Skipped (Data/Feature/Sim Issues): {symbols_with_issues}")
 
 
     if all_results:
         # Use initial capital from portfolio config (assumed same start for all sims here)
         initial_capital_per_sim = config.get('portfolio_capital_config',{}).get('initial_capital', 10000.0)
         total_initial_capital = initial_capital_per_sim * valid_results_count
-        total_final_capital = sum(res.get('final_capital', 0) for res in all_results.values())
+        # Filter out empty results before summing final capital
+        total_final_capital = sum(res.get('final_capital', 0) for res in all_results.values() if res)
 
         summary_lines.append(f"Total Initial Capital (Summed): ${total_initial_capital:.2f} ({valid_results_count} sims)")
         summary_lines.append(f"Total Final Capital (Summed):   ${total_final_capital:.2f}")
@@ -388,13 +394,18 @@ def run_simulation_or_training(config, logger):
              total_return = ((total_final_capital - total_initial_capital) / total_initial_capital) * 100
              summary_lines.append(f"Overall Return (Simple Sum):    {total_return:.2f}%")
 
-        # Average metrics
-        avg_win_rate = np.mean([res.get('win_rate', 0) for res in all_results.values()])
-        avg_max_drawdown = np.mean([res.get('max_drawdown', 0) for res in all_results.values()])
-        avg_sharpe = np.mean([res.get('sharpe_ratio', 0) for res in all_results.values()])
-        summary_lines.append(f"Average Win Rate:        {avg_win_rate:.2f}%")
-        summary_lines.append(f"Average Max Drawdown:    {avg_max_drawdown:.2f}%")
-        summary_lines.append(f"Average Sharpe Ratio:    {avg_sharpe:.3f}")
+        # Average metrics (filter out empty results)
+        valid_results_list = [res for res in all_results.values() if res]
+        if valid_results_list:
+             avg_win_rate = np.mean([res.get('win_rate', 0) for res in valid_results_list])
+             avg_max_drawdown = np.mean([res.get('max_drawdown', 0) for res in valid_results_list])
+             avg_sharpe = np.mean([res.get('sharpe_ratio', 0) for res in valid_results_list])
+             summary_lines.append(f"Average Win Rate:        {avg_win_rate:.2f}%")
+             summary_lines.append(f"Average Max Drawdown:    {avg_max_drawdown:.2f}%")
+             summary_lines.append(f"Average Sharpe Ratio:    {avg_sharpe:.3f}")
+        else:
+             summary_lines.append("No valid simulation results to calculate average metrics.")
+
 
     summary_lines.append("---------------------------------")
     summary_message = "\n".join(summary_lines)
@@ -478,7 +489,13 @@ def run_live(config, logger):
             logger.debug(f"Feature pipeline loaded/checked for {symbol}.")
 
             # 3. Model
-            model = create_model(model_cfg)
+            # --- Ensure num_features is correct before creating model ---
+            num_actual_features = len(fp.feature_extractor.feature_names)
+            if model_cfg.get('num_features') != num_actual_features:
+                 logger.warning(f"Model config num_features ({model_cfg.get('num_features')}) != actual features ({num_actual_features}) for {symbol}. Updating config for model creation.")
+                 model_cfg['num_features'] = num_actual_features
+
+            model = create_model(model_cfg) # Pass updated config
             model_path = os.path.join(load_base, f"{symbol}_final_model.pth") # Load the FINAL model
             if model_path and os.path.exists(model_path):
                 model.load_state_dict(torch.load(model_path, map_location=device))
