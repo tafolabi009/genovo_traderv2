@@ -1,64 +1,62 @@
 # configs/params.yaml
-# Configuration file for genovo_traderv2 - Correct num_features
+# Configuration file for genovo_traderv2 - Configured for Training Simulation
 
 # --- General Settings ---
-mode: 'simulation' # Start with 'simulation' or 'train' first, then switch to 'live' for demo trading
+mode: 'simulation' # Set to 'simulation' for training runs
 symbols:
-  - 'EURUSDm' # Updated Symbol Format
-  - 'GBPUSDm' # Updated Symbol Format
-  - 'USDJPYm' # Updated Symbol Format
-  - 'AUDUSDm' # Updated Symbol Format
-  - 'USDCADm' # Updated Symbol Format
-  # Add other symbols using the correct '...m' format if needed
+  - 'EURUSDm'
+  - 'GBPUSDm'
+  - 'USDJPYm'
+  - 'AUDUSDm'
+  - 'USDCADm'
 results_dir: 'results/'
 
 # --- MT5 Connection Configuration (mt5_config) ---
-# !! CONFIGURED FOR DEMO ACCOUNT !!
+# Used for fetching historical data during training
 mt5_config:
-  # !! Exness MT5 *DEMO* details !!
-  login: 209571100             # Your Exness MT5 *DEMO* account number
-  password: "Abioye@16"        # Your Exness MT5 *DEMO* account password
-  server: "Exness-MT5Trial9"   # Your Exness *DEMO* server
-  # !! Correct path to MT5 terminal executable on Windows !!
+  login: 209571100
+  password: "Abioye@16" # Consider using environment variables or secrets management for credentials
+  server: "Exness-MT5Trial9"
   path: "C:/Program Files/MetaTrader 5/terminal64.exe"
   default_slippage: 3
   retry_attempts: 3
   retry_delay_sec: 0.5
-  magic_number: 23456 # Example magic number
+  magic_number: 23456
 
 # --- API Keys (api_keys) ---
-# Store external API keys here (currently unused by code)
+# Not directly used in core training loop based on provided code, but kept for completeness
 api_keys:
   fred_api_key: "e225fb27a4fcba9f278f7623e30fbb46"
   newsapi_key: "ad32ddeb84e14ac89bb7dd13f87e0693"
 
 # --- Notification Settings (notifications) ---
-# For sending email alerts
+# Used for sending updates/errors during training/live runs
 notifications:
-  email_enabled: true # Email notifications are enabled
+  email_enabled: true
   email_address: "tafolabi009@gmail.com"
-  email_password: "jhbv znwi xxop yzyl" # Use App Password for Gmail if 2FA is enabled
+  email_password: "jhbv znwi xxop yzyl" # Consider using environment variables or app passwords
   email_smtp_server: "smtp.gmail.com"
   email_smtp_port: 587
-  email_recipient: "tabioye009@gmail.com,tafolabi009@gmail.com,ifeoluwaadegbite15@gmail.com,mckaydave200@gmail.com" # Comma-separated list
+  email_recipient: "tabioye009@gmail.com,tafolabi009@gmail.com,ifeoluwaadegbite15@gmail.com"
 
 # --- Data Configuration (data_config) ---
 data_config:
   source: 'mt5'
   timeframe: 'M1'
-  num_bars: 50000 # Keep reduced number of bars for now
+  num_bars: 50000 # Number of historical bars to load for training
 
 # --- Feature Engineering Configuration (feature_config) ---
 feature_config:
-  window_sizes: [5, 10, 20, 50, 100, 200] # Max window is 200
-  # num_features is determined dynamically, no need to set it here
+  window_sizes: [5, 10, 20, 50, 100, 200]
+  donchian_lower: 240 # ~4 hours M1
+  donchian_upper: 480 # ~8 hours M1
 
 # --- Model Configuration (model_config) ---
 model_config:
-  load_path_base: 'results/'
-  save_path_base: 'results/'
-  num_features: 99 # Set to the actual number of features generated (99)
-  seq_length: 201 # Increased sequence length > max window size (200)
+  load_path_base: 'results/' # Where to load existing models from (if resuming)
+  save_path_base: 'results/' # Where to save trained models
+  num_features: 116 # *** CORRECTED based on features.py calculation ***
+  seq_length: 201 # Input sequence length for the model
   hidden_size: 128
   num_layers: 2
   tcn_channels: [64, 128, 128]
@@ -71,60 +69,62 @@ model_config:
 strategy_config:
   agent_config: # PPO Agent hyperparameters
     learning_rate: 0.0001
-    gamma: 0.99
-    lambda_gae: 0.95
-    ppo_epsilon: 0.2
-    ppo_epochs: 8
+    gamma: 0.99 # Discount factor for future rewards
+    lambda_gae: 0.95 # Generalized Advantage Estimation lambda
+    ppo_epsilon: 0.2 # PPO clipping parameter
+    ppo_epochs: 8 # Number of optimization epochs per PPO update
     batch_size: 64
-    entropy_coef: 0.01
-    value_loss_coef: 0.5
-    catastrophic_memory_size: 20
+    entropy_coef: 0.02 # Exploration bonus coefficient
+    value_loss_coef: 0.5 # Coefficient for the value function loss
+    catastrophic_memory_size: 20 # Memory for repeated bad trades
 
-  reward_config: # Parameters for the custom reward function
-    pnl_scale: 100.0
-    profit_bonus_factor: 1.1
-    loss_penalty_factor: 1.5
-    max_loss_penalty: -50.0
-    uncertainty_penalty_factor: 0.5
-    high_volatility_penalty_factor: 0.3
-    trend_follow_bonus: 0.1
-    mean_revert_bonus: 0.1
-    trend_against_penalty: -0.2
-    mean_revert_against_penalty: -0.2
-    uncertain_regime_penalty: -0.1
-    holding_penalty_factor: -0.001
-    profit_capture_bonus: 0.5
-    quick_profit_bonus_factor: 0.2
-    sharpe_ratio_bonus_factor: 0.05
-    catastrophic_threshold: -20.0
-    catastrophic_repeat_penalty: -10.0
-    transaction_cost_penalty: -0.01
+  # --- Simplified Reward Config for Initial Training ---
+  reward_config:
+    pnl_scale: 100.0             # Scales the profit/loss component of the reward
+    profit_bonus_factor: 1.5     # Bonus multiplier for realized profits
+    loss_penalty_factor: 1.5     # Penalty multiplier for realized losses
+    max_loss_penalty: -10.0      # Maximum penalty for hitting stop loss
+    holding_penalty_factor: 0.0  # *** CHANGED: Removed penalty for holding to encourage initial trades ***
+    profit_capture_bonus: 1.0    # Bonus for closing a profitable trade via action (not TP)
+    transaction_cost_penalty: -0.05 # Small penalty per transaction cost incurred
+    # --- Other complex penalties/bonuses are OFF for simplification ---
+    uncertainty_penalty_factor: 0.0
+    high_volatility_penalty_factor: 0.0
+    trend_follow_bonus: 0.0
+    mean_revert_bonus: 0.0
+    trend_against_penalty: 0.0
+    mean_revert_against_penalty: 0.0
+    uncertain_regime_penalty: 0.0
+    quick_profit_bonus_factor: 0.0
+    sharpe_ratio_bonus_factor: 0.0
+    catastrophic_threshold: -20.0 # PnL threshold considered catastrophic
+    catastrophic_repeat_penalty: -5.0 # Penalty for repeated catastrophic losses
 
 # --- Portfolio Capital Management Configuration (portfolio_capital_config) ---
 portfolio_capital_config:
-  initial_capital: 10000.0 # Start demo simulation with typical demo balance
-  max_total_risk_pct: 0.05
-  max_allocation_per_trade_pct: 0.02
-  allocation_method: 'confidence_weighted'
-  kelly_fraction: 0.5
-  min_position_notional: 100
+  initial_capital: 5000.0 # *** CHANGED: Increased for simulation to allow trades ***
+  max_total_risk_pct: 0.05 # Max % of total capital at risk across all open positions
+  max_allocation_per_trade_pct: 0.02 # Max % of capital to risk on a single new trade
+  allocation_method: 'confidence_weighted' # How to distribute risk among signals
+  kelly_fraction: 0.5 # Parameter for Kelly criterion if used (not default here)
+  min_position_notional: 100 # Minimum required notional value for a trade (in account currency)
 
 # --- Simulator Configuration (simulator_config) ---
 simulator_config:
-  commission_pct: 0.00005 # Example: 0.005% per side (adjust based on broker)
-  slippage_pct: 0.0001   # Example: 0.01% slippage (adjust based on testing/reality)
-  update_agent_every: 256
-  print_every: 500
-  plot_results: true
+  commission_pct: 0.00005 # Broker commission per trade value
+  slippage_pct: 0.0001 # Simulated slippage per trade value
+  update_agent_every: 256 # How many simulation steps between PPO updates
+  print_every: 500 # How often to print simulation status
+  plot_results: true # Whether to generate a plot at the end of simulation
 
 # --- Live Trading Configuration (live_config) ---
-# Used when mode = 'live' (will run on demo account)
+# Not used when mode='simulation', but kept for completeness
 live_config:
   loop_interval_sec: 5
-  delay_after_close_ms: 500 # Delay in milliseconds after closing a position before opening another
+  delay_after_close_ms: 500
 
 # --- Logging Configuration (logging_config) ---
 logging_config:
-  log_level: 'INFO' # Set to 'DEBUG' for more detailed logs
-  log_file: 'results/genovo_traderv2_demo.log'
+  log_level: 'INFO' # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+  log_file: 'results/genovo_traderv2_demo.log' # Path to the log file
 

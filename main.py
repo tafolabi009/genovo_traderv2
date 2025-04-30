@@ -7,7 +7,7 @@ import os
 import argparse
 import torch
 import time
-import mt5 as mt5
+import mt5 as mt5 # Keep this specific import
 from collections import defaultdict
 import traceback
 import joblib # Import joblib for scaler save/load
@@ -226,6 +226,12 @@ def run_training_cycle(config, logger):
             except Exception as e: logger.error(f"Could not save final model for {symbol}: {e}", exc_info=True)
             if not scaler_saved or not model_saved: cycle_errors = True; logger.error(f"Failed to save scaler or model for {symbol}.")
             # Save history/plot optionally...
+            if sim_success and results and simulator.sim_config.get('plot_results', False):
+                try:
+                    simulator.plot_results(results)
+                except Exception as e:
+                    logger.error(f"Error plotting results for {symbol}: {e}")
+
 
         logger.info(f"--- Finished Simulation/Training Run for {symbol} ---")
 
@@ -233,7 +239,7 @@ def run_training_cycle(config, logger):
     # Return True only if precalc was successful AND no critical errors during simulation/saving
     return precalc_success and not cycle_errors
 
-# --- Live Trading Function (Refactored) ---
+# --- Live Trading Function (Refactored with Fix) ---
 def run_live_trading_loop(config, logger):
     """
     Initializes components and runs the main live trading loop indefinitely.
@@ -266,7 +272,17 @@ def run_live_trading_loop(config, logger):
     timeframe_map = {'M1': mt5.TIMEFRAME_M1, 'M5': mt5.TIMEFRAME_M5, 'M15': mt5.TIMEFRAME_M15, 'M30': mt5.TIMEFRAME_M30, 'H1': mt5.TIMEFRAME_H1, 'H4': mt5.TIMEFRAME_H4, 'D1': mt5.TIMEFRAME_D1}
     mt5_timeframe = timeframe_map.get(timeframe_str.upper())
     if not mt5_timeframe: logger.error(f"Invalid timeframe '{timeframe_str}'. Defaulting to M1."); mt5_timeframe = mt5.TIMEFRAME_M1
-    seq_length = config.get('model_config', {}).get('seq_length', 100)
+
+    # <<< FIX START >>>
+    feature_cfg = config.get('feature_config', {})
+    model_cfg = config.get('model_config', {})
+    donchian_upper = feature_cfg.get('donchian_upper', 480) # Get Donchian lookback
+    model_seq_length = model_cfg.get('seq_length', 201) # Get model sequence length
+    # Calculate max bars needed for features + model sequence
+    bars_to_fetch = max(model_seq_length, donchian_upper + 1) # Add buffer
+    logger.info(f"Determined bars_to_fetch for live features: {bars_to_fetch}")
+    # <<< FIX END >>>
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     results_dir = config.get('results_dir', 'results/')
     load_base = config.get('model_config', {}).get('load_path_base', results_dir)
@@ -351,14 +367,38 @@ def run_live_trading_loop(config, logger):
 
             for symbol in active_symbols: # Iterate through successfully loaded symbols
                 model = models[symbol]; agent = agents[symbol]; fp = feature_pipelines[symbol]
-                current_state_df = mt5_interface.get_recent_bars(symbol, mt5_timeframe, seq_length)
-                if current_state_df is None or len(current_state_df) < seq_length: logger.warning(f"Not enough bars for {symbol}. Skipping signal."); continue
+
+                # <<< FIX START >>> Fetch enough data
+                current_state_df = mt5_interface.get_recent_bars(symbol, mt5_timeframe, bars_to_fetch)
+                if current_state_df is None or len(current_state_df) < bars_to_fetch:
+                    logger.warning(f"Not enough bars ({len(current_state_df) if current_state_df is not None else 0}/{bars_to_fetch}) for {symbol} feature calculation. Skipping.")
+                    continue
+                # <<< FIX END >>>
+
                 try: # Feature processing
-                    raw_features = fp.feature_extractor._extract_all_features(current_state_df)
-                    features_df = fp.transform(raw_features)
-                    if features_df.empty or features_df.isnull().values.any(): logger.warning(f"Features empty/NaN for {symbol}. Skipping."); continue
+                    # <<< FIX START >>> Calculate on full, transform slice
+                    # Calculate features on the full fetched history
+                    raw_features_full = fp.feature_extractor._extract_all_features(current_state_df)
+
+                    # Select the last 'model_seq_length' rows for scaling and model input
+                    raw_features_for_transform = raw_features_full.tail(model_seq_length)
+
+                    if len(raw_features_for_transform) < model_seq_length:
+                         logger.warning(f"Could not get required sequence length ({model_seq_length}) after feature calculation for {symbol}. Skipping.")
+                         continue
+
+                    # Transform only the required sequence length
+                    features_df = fp.transform(raw_features_for_transform)
+                    # <<< FIX END >>>
+
+                    if features_df.empty or features_df.isnull().values.any():
+                        logger.warning(f"Features empty/NaN after transform for {symbol}. Skipping.")
+                        continue
                     state_tensor = torch.FloatTensor(features_df.values).unsqueeze(0).to(device)
-                except Exception as e: logger.error(f"Error creating features for {symbol}: {e}", exc_info=True); continue
+                except Exception as e:
+                    logger.error(f"Error creating features for {symbol}: {e}", exc_info=True)
+                    continue
+
                 try: # Model inference
                     action, _, _, _, _, model_outputs = agent.select_action(state_tensor)
                     policy_logits = model_outputs.get('policy_logits', torch.zeros(1,3)); action_probs = torch.softmax(policy_logits, dim=-1)
@@ -534,8 +574,8 @@ def main():
         print(f"ERROR: Configuration file not found. {e}")
         if logger: logger.critical(f"Configuration file not found: {e}")
     except KeyboardInterrupt:
-         logger.info("Main process interrupted by user (Ctrl+C). Shutting down.")
-         send_email_notification("GenovoTraderV2 Stopped", "Main process stopped by user.", config)
+         if logger: logger.info("Main process interrupted by user (Ctrl+C). Shutting down.")
+         if config: send_email_notification("GenovoTraderV2 Stopped", "Main process stopped by user.", config)
     except Exception as e:
         print(f"FATAL ERROR during execution: {e}")
         print(traceback.format_exc())
