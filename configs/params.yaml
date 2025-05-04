@@ -1,9 +1,9 @@
 # configs/params.yaml
-# Configuration file for genovo_traderv2 - Configured for Training Simulation
+# Configuration file for genovo_traderv2 - Updated with Broker Section
 
 # --- General Settings ---
-mode: 'simulation' # Set to 'simulation' for training runs
-symbols:
+mode: 'simulation' # Set to 'simulation' for training runs, 'live' for trading
+symbols: # Symbols used for trading/simulation
   - 'EURUSDm'
   - 'GBPUSDm'
   - 'USDJPYm'
@@ -11,51 +11,87 @@ symbols:
   - 'USDCADm'
 results_dir: 'results/'
 
-# --- MT5 Connection Configuration (mt5_config) ---
-# Used for fetching historical data during training
-mt5_config:
+# --- Broker Configuration ---
+# Consolidated section for MetaTrader 5 connection and interface settings
+broker:
+  # --- Connection details ---
   login: 209571100
-  password: "Abioye@16" # Consider using environment variables or secrets management for credentials
+  password: "Abioye@16" # IMPORTANT: Use environment variables or a secure secrets manager in production!
   server: "Exness-MT5Trial9"
-  path: "C:/Program Files/MetaTrader 5/terminal64.exe"
-  default_slippage: 3
-  retry_attempts: 3
-  retry_delay_sec: 0.5
-  magic_number: 23456
+  path: "C:/Program Files/MetaTrader 5/terminal64.exe" # Path to MT5 terminal executable
+
+  # --- Interface/Order settings ---
+  default_slippage: 3 # Default slippage for orders
+  order_retries: 3 # Number of times to retry sending a failed order (for retryable errors)
+  retry_delay: 1.5 # Delay in seconds between order retries
+  magic_number: 23456 # Magic number for identifying trades placed by this bot
+
+  # --- NEW: Currency Conversion Symbol Mapping ---
+  # Maps standard currency pairs (FROM_TO) to the exact symbol name
+  # your broker provides for fetching the conversion rate tick.
+  # Verify these symbols in your MT5 Market Watch!
+  conversion_symbols:
+    # Assuming account currency is USD and rate symbols also use 'm' suffix
+    "EURUSD": "EURUSDm" # Symbol for EUR -> USD rate
+    "GBPUSD": "GBPUSDm" # Symbol for GBP -> USD rate
+    "USDJPY": "USDJPYm" # Symbol for USD -> JPY rate
+    "AUDUSD": "AUDUSDm" # Symbol for AUD -> USD rate
+    "USDCAD": "USDCADm" # Symbol for USD -> CAD rate
+    # Add other pairs if needed, e.g., if account currency was EUR:
+    # "USDJPY": "USDJPYm" # Still need USD->JPY
+    # "EURUSD": "EURUSDm" # Need EUR->USD (though rate is 1 if account is EUR)
+    # "EURGBP": "EURGBPm" # Need EUR->GBP rate (assuming symbol exists)
+    # "EURJPY": "EURJPYm" # Need EUR->JPY rate (assuming symbol exists)
+
+  # --- Fallback Symbol Info (Optional) ---
+  # Use this if mt5.symbol_info() fails for a specific symbol
+  # Provide necessary attributes used in calculations (like _calculate_lots)
+  symbol_info_fallback:
+    # Example (Uncomment and adjust if needed for a symbol):
+    # "UNCOMMON_SYMBOLm":
+    #   currency_base: "UNC"
+    #   currency_profit: "USD"
+    #   trade_contract_size: 10000.0
+    #   point: 0.001
+    #   digits: 3
+    #   volume_step: 0.1
+    #   volume_min: 0.1
+    #   volume_max: 50.0
+    pass # No fallbacks defined by default
 
 # --- API Keys (api_keys) ---
-# Not directly used in core training loop based on provided code, but kept for completeness
+# Kept for completeness, ensure keys are managed securely
 api_keys:
   fred_api_key: "e225fb27a4fcba9f278f7623e30fbb46"
   newsapi_key: "ad32ddeb84e14ac89bb7dd13f87e0693"
 
 # --- Notification Settings (notifications) ---
-# Used for sending updates/errors during training/live runs
+# Used for sending updates/errors
 notifications:
   email_enabled: true
   email_address: "tafolabi009@gmail.com"
-  email_password: "jhbv znwi xxop yzyl" # Consider using environment variables or app passwords
+  email_password: "jhbv znwi xxop yzyl" # IMPORTANT: Use environment variables or app passwords!
   email_smtp_server: "smtp.gmail.com"
   email_smtp_port: 587
   email_recipient: "tabioye009@gmail.com,tafolabi009@gmail.com,ifeoluwaadegbite15@gmail.com"
 
 # --- Data Configuration (data_config) ---
 data_config:
-  source: 'mt5'
-  timeframe: 'M1'
-  num_bars: 50000 # Number of historical bars to load for training
+  source: 'mt5' # Keep as 'mt5' for using the broker interface
+  timeframe: 'M1' # Timeframe for historical data/features
+  num_bars: 50000 # Number of historical bars to load for training/simulation start
 
 # --- Feature Engineering Configuration (feature_config) ---
 feature_config:
   window_sizes: [5, 10, 20, 50, 100, 200]
-  donchian_lower: 240 # ~4 hours M1
-  donchian_upper: 480 # ~8 hours M1
+  donchian_lower: 240 # ~4 hours on M1
+  donchian_upper: 480 # ~8 hours on M1
 
 # --- Model Configuration (model_config) ---
 model_config:
-  load_path_base: 'results/' # Where to load existing models from (if resuming)
+  load_path_base: 'results/' # Where to load existing models from
   save_path_base: 'results/' # Where to save trained models
-  num_features: 116 # *** CORRECTED based on features.py calculation ***
+  num_features: 116 # *** Ensure this matches output of features.py ***
   seq_length: 201 # Input sequence length for the model
   hidden_size: 128
   num_layers: 2
@@ -78,16 +114,14 @@ strategy_config:
     value_loss_coef: 0.5 # Coefficient for the value function loss
     catastrophic_memory_size: 20 # Memory for repeated bad trades
 
-  # --- Simplified Reward Config for Initial Training ---
-  reward_config:
-    pnl_scale: 100.0             # Scales the profit/loss component of the reward
-    profit_bonus_factor: 1.5     # Bonus multiplier for realized profits
-    loss_penalty_factor: 1.5     # Penalty multiplier for realized losses
-    max_loss_penalty: -10.0      # Maximum penalty for hitting stop loss
-    holding_penalty_factor: 0.0  # *** CHANGED: Removed penalty for holding to encourage initial trades ***
-    profit_capture_bonus: 1.0    # Bonus for closing a profitable trade via action (not TP)
-    transaction_cost_penalty: -0.05 # Small penalty per transaction cost incurred
-    # --- Other complex penalties/bonuses are OFF for simplification ---
+  reward_config: # Simplified reward structure from original file
+    pnl_scale: 100.0
+    profit_bonus_factor: 1.5
+    loss_penalty_factor: 1.5
+    max_loss_penalty: -10.0
+    holding_penalty_factor: 0.0
+    profit_capture_bonus: 1.0
+    transaction_cost_penalty: -0.05
     uncertainty_penalty_factor: 0.0
     high_volatility_penalty_factor: 0.0
     trend_follow_bonus: 0.0
@@ -97,34 +131,34 @@ strategy_config:
     uncertain_regime_penalty: 0.0
     quick_profit_bonus_factor: 0.0
     sharpe_ratio_bonus_factor: 0.0
-    catastrophic_threshold: -20.0 # PnL threshold considered catastrophic
-    catastrophic_repeat_penalty: -5.0 # Penalty for repeated catastrophic losses
+    catastrophic_threshold: -20.0
+    catastrophic_repeat_penalty: -5.0
 
 # --- Portfolio Capital Management Configuration (portfolio_capital_config) ---
 portfolio_capital_config:
-  initial_capital: 5000.0 # *** CHANGED: Increased for simulation to allow trades ***
-  max_total_risk_pct: 0.05 # Max % of total capital at risk across all open positions
-  max_allocation_per_trade_pct: 0.02 # Max % of capital to risk on a single new trade
-  allocation_method: 'confidence_weighted' # How to distribute risk among signals
-  kelly_fraction: 0.5 # Parameter for Kelly criterion if used (not default here)
+  initial_capital: 5000.0 # Initial capital for simulation/live trading
+  max_total_risk_pct: 0.05 # Max % of total capital at risk across all open positions (e.g., 0.05 = 5%)
+  max_allocation_per_trade_pct: 0.02 # Max % of capital to risk on a single new trade (e.g., 0.02 = 2%)
+  allocation_method: 'confidence_weighted' # Options: 'equal_weight', 'confidence_weighted', 'kelly'
+  kelly_fraction: 0.5 # Parameter for Kelly criterion if used
   min_position_notional: 100 # Minimum required notional value for a trade (in account currency)
 
 # --- Simulator Configuration (simulator_config) ---
+# Used only when mode = 'simulation'
 simulator_config:
-  commission_pct: 0.00005 # Broker commission per trade value
-  slippage_pct: 0.0001 # Simulated slippage per trade value
+  commission_pct: 0.00005 # Broker commission per trade value (e.g., 0.00005 = 0.005%)
+  slippage_pct: 0.0001 # Simulated slippage per trade value (e.g., 0.0001 = 0.01%)
   update_agent_every: 256 # How many simulation steps between PPO updates
   print_every: 500 # How often to print simulation status
   plot_results: true # Whether to generate a plot at the end of simulation
 
 # --- Live Trading Configuration (live_config) ---
-# Not used when mode='simulation', but kept for completeness
+# Used only when mode = 'live'
 live_config:
-  loop_interval_sec: 5
-  delay_after_close_ms: 500
+  loop_interval_sec: 5 # Interval between main trading loop iterations
+  delay_after_close_ms: 500 # Small delay after closing a position
 
 # --- Logging Configuration (logging_config) ---
 logging_config:
   log_level: 'INFO' # Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-  log_file: 'results/genovo_traderv2_demo.log' # Path to the log file
-
+  log_file: 'results/genovo_traderv2.log' # Path to the log file (updated name slightly)
