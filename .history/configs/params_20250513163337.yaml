@@ -11,21 +11,14 @@ symbols: # Symbols used for trading/simulation
   - 'USDCADm'
 results_dir: 'results/'
 
-# --- MT5 Connection Configuration ---
-mt5_config:
-  login: 209571100
-  password: "Abioye@16" # IMPORTANT: Use environment variables or a secure secrets manager in production!
-  server: "Exness-MT5Trial9"
-  path: "C:\\Program Files\\MetaTrader 5\\terminal64.exe" # Path to MT5 terminal executable (double backslashes for Windows)
-
 # --- Broker Configuration ---
 # Consolidated section for MetaTrader 5 connection and interface settings
 broker:
   # --- Connection details ---
-  account_id: 209571100
+  login: 209571100
   password: "Abioye@16" # IMPORTANT: Use environment variables or a secure secrets manager in production!
   server: "Exness-MT5Trial9"
-  mt5_path: "C:\\Program Files\\MetaTrader 5\\terminal64.exe" # Path to MT5 terminal executable (double backslashes for Windows)
+  path: "C:\Program Files\MetaTrader 5\terminal64.exe" # Path to MT5 terminal executable
 
   # --- Interface/Order settings ---
   default_slippage: 3 # Default slippage for orders
