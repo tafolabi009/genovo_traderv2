@@ -316,3 +316,28 @@ Configuration loaded successfully.
 2025-05-13 15:40:41 - genovo_traderv2 - INFO - Attempting to send email notification to ['ifeoluwaadegbite15@gmail.com', 'tabioye009@gmail.com', 'tafolabi009@gmail.com']...
 2025-05-13 15:40:42 - genovo_traderv2 - INFO - Email notification sent successfully.
 2025-05-13 15:40:42 - genovo_traderv2 - INFO - --- Genovo Trader v2 finished ---
+Configuration loaded successfully.
+2025-05-13 15:56:11 - genovo_traderv2 - INFO - Logging initialized. Level: INFO. File: results/genovo_traderv2.log
+2025-05-13 15:56:11 - genovo_traderv2 - INFO - --- Starting Genovo Trader v2 (Multi-Symbol) ---
+2025-05-13 15:56:11 - genovo_traderv2 - INFO - Run Mode: live
+2025-05-13 15:56:11 - genovo_traderv2 - INFO - Using device: cuda
+2025-05-13 15:56:11 - genovo_traderv2 - INFO - Attempting to send email notification to ['tabioye009@gmail.com', 'ifeoluwaadegbite15@gmail.com', 'tafolabi009@gmail.com']...
+2025-05-13 15:56:17 - genovo_traderv2 - INFO - Email notification sent successfully.
+2025-05-13 15:56:17 - genovo_traderv2 - INFO - Running in Continuous Live Trading mode with Weekly Retraining.
+2025-05-13 15:56:17 - genovo_traderv2 - INFO - Loaded last training time: 2025-04-30 02:31:56.841282
+2025-05-13 15:56:17 - genovo_traderv2 - INFO - Retraining triggered. Time since last train: 13 days, 13:24:20.890228
+2025-05-13 15:56:17 - genovo_traderv2 - INFO - Attempting to send email notification to ['tabioye009@gmail.com', 'ifeoluwaadegbite15@gmail.com', 'tafolabi009@gmail.com']...
+2025-05-13 15:56:20 - genovo_traderv2 - INFO - Email notification sent successfully.
+2025-05-13 15:56:21 - genovo_traderv2 - INFO - --- Starting Training Cycle ---
+2025-05-13 15:56:21 - genovo_traderv2 - INFO - Initializing MT5 connection from path: C:\Program Files\MetaTrader 5\terminal64.exe...
+2025-05-13 15:57:32 - genovo_traderv2 - ERROR - MT5 initialize() failed, error code = (-10005, 'IPC timeout')
+2025-05-13 15:57:32 - genovo_traderv2 - ERROR - MT5 connection failed. Cannot start training cycle.
+2025-05-13 15:57:32 - genovo_traderv2 - ERROR - Weekly retraining cycle failed or had errors. Live trading will continue with previous models/scalers.
+2025-05-13 15:57:32 - genovo_traderv2 - INFO - Attempting to send email notification to ['tabioye009@gmail.com', 'ifeoluwaadegbite15@gmail.com', 'tafolabi009@gmail.com']...
+2025-05-13 15:57:33 - genovo_traderv2 - INFO - Email notification sent successfully.
+2025-05-13 15:57:33 - genovo_traderv2 - INFO - Pausing briefly after training attempt...
+2025-05-13 15:58:03 - genovo_traderv2 - INFO - Retraining triggered. Time since last train: 13 days, 13:26:06.399289
+2025-05-13 15:58:03 - genovo_traderv2 - INFO - Attempting to send email notification to ['tabioye009@gmail.com', 'ifeoluwaadegbite15@gmail.com', 'tafolabi009@gmail.com']...
+2025-05-13 15:58:03 - genovo_traderv2 - INFO - Email notification sent successfully.
+2025-05-13 15:58:03 - genovo_traderv2 - INFO - --- Starting Training Cycle ---
+2025-05-13 15:58:03 - genovo_traderv2 - INFO - Initializing MT5 connection from path: C:\Program Files\MetaTrader 5\terminal64.exe...
