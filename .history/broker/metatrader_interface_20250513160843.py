@@ -892,25 +892,6 @@ class MetatraderInterface:
              return {"error": f"Exception getting account summary: {e}"}
 
 
-# Function to create and configure a MetatraderInterface instance
-def create_mt5_interface(config):
-    """
-    Creates and returns a configured MetatraderInterface instance.
-    
-    Args:
-        config (dict): Configuration dictionary containing broker settings
-        
-    Returns:
-        MetatraderInterface: Configured interface instance
-    """
-    mt_interface = MetatraderInterface(config)
-    try:
-        mt_interface.connect()
-    except Exception as e:
-        logger.error(f"Failed to connect to MetaTrader: {e}")
-    return mt_interface
-
-
 # Example usage (optional, for testing)
 if __name__ == '__main__':
     import yaml

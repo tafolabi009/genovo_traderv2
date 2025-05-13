@@ -7,7 +7,7 @@ import os
 import argparse
 import torch
 import time
-import MetaTrader5 as mt5 # Import MetaTrader5 package
+import mt5 as mt5 # Keep this specific import
 from collections import defaultdict
 import traceback
 import joblib # Import joblib for scaler save/load
@@ -18,7 +18,7 @@ from datetime import datetime, timedelta # For scheduling
 from core.simulator import create_simulator
 from utils.logger import setup_logger
 from data.preprocessing import create_preprocessor
-from broker.metatrader_interface import MetatraderInterface, create_mt5_interface
+from broker.metatrader_interface import MetaTraderInterface, create_mt5_interface
 from core.features import create_feature_pipeline
 from core.model import create_model
 from core.strategy import create_strategy

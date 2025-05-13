@@ -7,7 +7,7 @@ import os
 import argparse
 import torch
 import time
-import MetaTrader5 as mt5 # Import MetaTrader5 package
+import mt5 as mt5 # Keep this specific import
 from collections import defaultdict
 import traceback
 import joblib # Import joblib for scaler save/load
