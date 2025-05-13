@@ -18,7 +18,7 @@ broker:
   login: 209571100
   password: "Abioye@16" # IMPORTANT: Use environment variables or a secure secrets manager in production!
   server: "Exness-MT5Trial9"
-  path: "C:/Program Files/MetaTrader 5/terminal64.exe" # Path to MT5 terminal executable
+  path: "C:\Program Files\MetaTrader 5\terminal64.exe" # Path to MT5 terminal executable
 
   # --- Interface/Order settings ---
   default_slippage: 3 # Default slippage for orders
