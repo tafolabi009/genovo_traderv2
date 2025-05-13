@@ -1,4 +1,3 @@
-Configuration loaded successfully.
 2025-05-13 15:24:48 - genovo_traderv2 - INFO - Logging initialized. Level: INFO. File: results/genovo_traderv2.log
 2025-05-13 15:24:48 - genovo_traderv2 - INFO - --- Starting Genovo Trader v2 (Multi-Symbol) ---
 2025-05-13 15:24:48 - genovo_traderv2 - INFO - Run Mode: live
@@ -281,7 +280,6 @@ Configuration loaded successfully.
 2025-05-13 15:38:45 - genovo_traderv2 - INFO - Attempting to send email notification to ['tafolabi009@gmail.com', 'ifeoluwaadegbite15@gmail.com', 'tabioye009@gmail.com']...
 2025-05-13 15:38:46 - genovo_traderv2 - INFO - Email notification sent successfully.
 2025-05-13 15:38:46 - genovo_traderv2 - INFO - --- Genovo Trader v2 finished ---
-Configuration loaded successfully.
 2025-05-13 15:39:05 - genovo_traderv2 - INFO - Logging initialized. Level: INFO. File: results/genovo_traderv2.log
 2025-05-13 15:39:05 - genovo_traderv2 - INFO - --- Starting Genovo Trader v2 (Multi-Symbol) ---
 2025-05-13 15:39:05 - genovo_traderv2 - INFO - Run Mode: live
