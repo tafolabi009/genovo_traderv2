@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 # from statsmodels.tsa.stattools import adfuller # Not used currently
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 # import talib # Removed talib
 import pandas_ta  # Import pandas_ta
 from collections import deque
@@ -12,322 +12,500 @@ import joblib # Keep joblib for scaler persistence
 import os
 import warnings # To suppress specific pandas_ta warnings if needed
 import logging # Import logging
+import talib
+from joblib import dump, load
+import pywt  # Wavelet transforms
+from filterpy.kalman import KalmanFilter
+from scipy.signal import savgol_filter
+from sklearn.feature_selection import mutual_info_regression
+import empyrical as ep  # Risk metrics
 
 logger = logging.getLogger("genovo_traderv2") # Get logger
 
 # Suppress specific PerformanceWarnings from pandas_ta if they become noisy
 # warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 
-class FeatureExtractor:
-    """
-    Comprehensive feature extraction pipeline using pandas-ta.
-    Generates price, volume, technical, statistical, volatility,
-    trend, seasonality features. Includes Donchian Channel.
-    Includes robust scaler fitting and transformation.
-    """
-    def __init__(self, config=None):
-        self.config = config or {}
-        self.window_sizes = self.config.get('window_sizes', [5, 10, 20, 50, 100, 200]) # Keep 200 for other features
-        # --- Donchian Config ---
-        # Use lengths appropriate for your timeframe (M1).
-        # 50 weeks = 50*5*24*60 = 360,000 M1 bars (too long!)
-        # Let's use shorter, more typical lengths for M1, e.g., related to hours/days
-        # Example: ~4 hours (240), ~8 hours (480), ~1 day (1440)
-        self.donchian_lower_length = self.config.get('donchian_lower', 240) # e.g., 4-hour low
-        self.donchian_upper_length = self.config.get('donchian_upper', 480) # e.g., 8-hour high
-        # --- End Donchian Config ---
+class KalmanFilterFeatures:
+    """Kalman filter for price and volume smoothing"""
+    def __init__(self):
+        self.price_kf = None
+        self.volume_kf = None
+        
+    def initialize_filters(self, n_dim=1):
+        self.price_kf = KalmanFilter(dim_x=2, dim_z=1)
+        self.price_kf.x = np.zeros(2)
+        self.price_kf.F = np.array([[1., 1.], [0., 1.]])
+        self.price_kf.H = np.array([[1., 0.]])
+        self.price_kf.P *= 1000.
+        self.price_kf.R = 5
+        self.price_kf.Q = np.array([[0.1, 0.1], [0.1, 0.1]])
+        
+        self.volume_kf = KalmanFilter(dim_x=2, dim_z=1)
+        self.volume_kf.x = np.zeros(2)
+        self.volume_kf.F = np.array([[1., 1.], [0., 1.]])
+        self.volume_kf.H = np.array([[1., 0.]])
+        self.volume_kf.P *= 1000.
+        self.volume_kf.R = 50
+        self.volume_kf.Q = np.array([[1., 1.], [1., 1.]])
+        
+    def update(self, measurement, kf):
+        kf.predict()
+        kf.update(measurement)
+        return kf.x[0], kf.x[1]  # Return state and velocity
 
-        self.feature_names = [] # Stores names of features the scaler is fitted on
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-        self.tick_buffer = deque(maxlen=max(self.window_sizes + [self.donchian_lower_length, self.donchian_upper_length])) # Adjust buffer if needed
-        self.order_book_buffer = deque(maxlen=200)
-        self.feature_means = None
-        self.feature_stds = None
-        # print("FeatureExtractor initialized (using pandas-ta).")
-
-    def fit(self, market_data):
-        """ Fits the scaler based on historical market data. """
-        if market_data is None or market_data.empty:
-             self.is_fitted = False; return self
-        features = self._extract_all_features(market_data)
-        numeric_cols = features.select_dtypes(include=np.number).columns.tolist()
-        if not numeric_cols: self.is_fitted = False; return self
-        features_numeric = features[numeric_cols]
-        features_numeric = features_numeric.replace([np.inf, -np.inf], np.nan)
-        features_filled = features_numeric.ffill().bfill()
-        cols_with_nans = features_filled.columns[features_filled.isnull().any()].tolist()
-        if cols_with_nans: features_cleaned = features_filled.drop(columns=cols_with_nans)
-        else: features_cleaned = features_filled
-        cols_to_drop = features_cleaned.columns[features_cleaned.var() == 0]
-        if not cols_to_drop.empty: features_cleaned = features_cleaned.drop(columns=cols_to_drop)
-        if features_cleaned.empty: self.is_fitted = False; return self
-        try:
-            self.scaler.fit(features_cleaned)
-            self.is_fitted = True
-            self.feature_names = features_cleaned.columns.tolist()
-            self.feature_means = features_cleaned.mean()
-            self.feature_stds = features_cleaned.std()
-            logger.info(f"FeatureExtractor fitted with {len(self.feature_names)} numeric features.") # Log actual count
-        except ValueError as e:
-             logger.error(f"Error fitting scaler: {e}. Check for constant features or other issues.", exc_info=True)
-             self.is_fitted = False; self.feature_names = []
-        return self
-
-    def transform(self, raw_features_data):
-        """ Transforms pre-calculated raw features into a scaled feature matrix. """
-        if not self.is_fitted:
-            logger.error("Scaler not fitted. Cannot transform features.")
-            return pd.DataFrame(columns=self.feature_names)
-        if raw_features_data is None or raw_features_data.empty:
-             logger.warning("Empty raw features data provided for transform.")
-             return pd.DataFrame(columns=self.feature_names)
-
-        features = raw_features_data.copy()
-        cols_to_scale = []
-        missing_cols = []
-        extra_cols = list(features.columns)
-        for col in self.feature_names:
-            if col in features.columns:
-                cols_to_scale.append(col)
-                if col in extra_cols: extra_cols.remove(col)
-            else: missing_cols.append(col)
-        # if missing_cols: logger.warning(f"Features missing during transform (needed by scaler): {missing_cols}. They will be added and filled with 0.") # Reduce log noise
-        # if extra_cols: logger.debug(f"Extra features found during transform (not used by scaler): {extra_cols}. They will be dropped.") # Reduce log noise
-        if not cols_to_scale:
-             logger.warning("No features available to scale matching the fitted scaler.")
-             return pd.DataFrame(0, index=features.index, columns=self.feature_names)
-
-        features_to_scale_df = features[cols_to_scale]
-        features_to_scale_df = features_to_scale_df.replace([np.inf, -np.inf], np.nan)
-        features_filled = features_to_scale_df.ffill().bfill()
-        if features_filled.isnull().values.any():
-             # logger.warning("NaNs still present after ffill/bfill before scaling. Filling remaining NaNs with 0.")
-             features_filled.fillna(0, inplace=True) # Fill remaining with 0
-
-        try:
-             scaled_array = self.scaler.transform(features_filled)
-             scaled_features = pd.DataFrame(scaled_array, index=features_filled.index, columns=cols_to_scale)
-             if missing_cols:
-                  for col in missing_cols: scaled_features[col] = 0.0
-                  scaled_features = scaled_features[self.feature_names]
-             return scaled_features
-        except ValueError as e:
-             logger.error(f"Error transforming features: {e}. Returning empty DataFrame.", exc_info=True)
-             return pd.DataFrame(columns=self.feature_names)
-        except Exception as e:
-             logger.error(f"Unexpected error during feature transformation: {e}", exc_info=True)
-             return pd.DataFrame(columns=self.feature_names)
-
-    def save_scaler(self, path):
-        """Saves the fitted scaler and feature names to a file using joblib."""
-        if self.is_fitted:
-            try:
-                scaler_state = {'scaler': self.scaler, 'feature_names': self.feature_names, 'feature_means': self.feature_means, 'feature_stds': self.feature_stds}
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                joblib.dump(scaler_state, path)
-                logger.info(f"Scaler state saved successfully to {path}")
-                return True
-            except Exception as e:
-                logger.error(f"Error saving scaler state to {path}: {e}", exc_info=True)
-                return False
-        else:
-            logger.warning("Scaler not fitted. Cannot save state.")
-            return False
-
-    def load_scaler(self, path):
-        """Loads the scaler and feature names from a file using joblib."""
-        logger.debug(f"Attempting to load scaler state from: {path}")
-        if os.path.exists(path):
-            try:
-                scaler_state = joblib.load(path)
-                if 'scaler' not in scaler_state or 'feature_names' not in scaler_state:
-                     logger.error(f"Invalid scaler state file format in {path}. Missing 'scaler' or 'feature_names'.")
-                     self.is_fitted = False; self.feature_names = []; return
-                self.scaler = scaler_state['scaler']
-                self.feature_names = scaler_state['feature_names']
-                self.feature_means = scaler_state.get('feature_means')
-                self.feature_stds = scaler_state.get('feature_stds')
-                self.is_fitted = True
-                logger.info(f"Scaler state loaded successfully from {path} ({len(self.feature_names)} features).")
-            except ModuleNotFoundError as e:
-                 logger.error(f"Error loading scaler state from {path}: Module not found. Sklearn version mismatch? Error: {e}", exc_info=True)
-                 self.is_fitted = False; self.feature_names = []
-            except EOFError as e:
-                 logger.error(f"Error loading scaler state from {path}: EOFError. File might be corrupted or incomplete. Error: {e}", exc_info=True)
-                 self.is_fitted = False; self.feature_names = []
-            except Exception as e:
-                logger.error(f"Error loading scaler state from {path}: {type(e).__name__}: {e}", exc_info=True)
-                self.is_fitted = False; self.feature_names = []
-        else:
-            logger.error(f"Scaler state file not found at {path}. Scaler remains unfitted.")
-            self.is_fitted = False; self.feature_names = []
-
-
-    def _extract_all_features(self, market_data):
-        """Internal method to orchestrate feature extraction using pandas-ta."""
-        df = market_data.copy()
-        required_cols = ['open', 'high', 'low', 'close', 'volume']
-        df.columns = df.columns.str.lower()
-        if not all(col in df.columns for col in required_cols):
-            raise ValueError(f"Market data must contain columns: {required_cols}")
-
-        # Calculate features, catching potential errors for individual groups
-        try: self._add_price_features_pta(df)
-        except Exception as e: logger.warning(f"Warning during price features: {e}")
-        try: self._add_volume_features_pta(df)
-        except Exception as e: logger.warning(f"Warning during volume features: {e}")
-        try: self._add_technical_indicators_pta(df)
-        except Exception as e: logger.warning(f"Warning during technical indicators: {e}")
-        try: self._add_statistical_features_pta(df)
-        except Exception as e: logger.warning(f"Warning during statistical features: {e}")
-        try: self._add_volatility_features_pta(df)
-        except Exception as e: logger.warning(f"Warning during volatility features: {e}")
-        try: self._add_trend_features_pta(df)
-        except Exception as e: logger.warning(f"Warning during trend features: {e}")
-        try: self._add_seasonality_features(df)
-        except Exception as e: logger.warning(f"Warning during seasonality features: {e}")
-        # --- Add Donchian Channel ---
-        try: self._add_donchian_channel_pta(df)
-        except Exception as e: logger.warning(f"Warning during Donchian Channel calculation: {e}")
-        # --- End Add Donchian Channel ---
-
-
-        original_cols = ['open', 'high', 'low', 'close', 'volume']
-        features = df.drop(columns=original_cols, errors='ignore')
-        features.replace([np.inf, -np.inf], np.nan, inplace=True)
+class WaveletFeatures:
+    """Wavelet-based feature extraction"""
+    def __init__(self, wavelet='db1', level=3):
+        self.wavelet = wavelet
+        self.level = level
+        
+    def decompose(self, data):
+        coeffs = pywt.wavedec(data, self.wavelet, level=self.level)
+        return coeffs
+        
+    def get_features(self, data):
+        coeffs = self.decompose(data)
+        features = {}
+        for i, coeff in enumerate(coeffs):
+            if i == 0:
+                features[f'wavelet_a{self.level}'] = coeff
+            else:
+                features[f'wavelet_d{self.level-i+1}'] = coeff
         return features
 
-    # --- Individual Feature Group Methods using pandas-ta ---
-    # (Keep existing methods: _add_price_features_pta, _add_volume_features_pta, etc.)
-    def _add_price_features_pta(self, df):
-        df.ta.log_return(cumulative=False, append=True)
-        df.ta.percent_return(cumulative=False, append=True)
-        df.loc[:, 'high_low_ratio'] = (df['high'] / df['low']).replace([np.inf, -np.inf], np.nan)
-        df.loc[:, 'close_open_ratio'] = (df['close'] / df['open']).replace([np.inf, -np.inf], np.nan)
+class MarketMicrostructureFeatures:
+    """Advanced market microstructure features"""
+    def __init__(self):
+        self.prev_trades = None
+        
+    def calculate_vpin(self, volume, price_change, window=50):
+        """Volume-synchronized Probability of Informed Trading"""
+        signed_volume = volume * np.sign(price_change)
+        buy_volume = np.where(signed_volume > 0, signed_volume, 0)
+        sell_volume = np.where(signed_volume < 0, -signed_volume, 0)
+        vpin = pd.Series(abs(buy_volume - sell_volume) / (buy_volume + sell_volume)).rolling(window).mean()
+        return vpin
+        
+    def calculate_kyle_lambda(self, price_change, volume, window=50):
+        """Kyle's Lambda (Price Impact)"""
+        abs_price_change = abs(price_change)
+        kyle_lambda = pd.Series(abs_price_change / volume).rolling(window).mean()
+        return kyle_lambda
+        
+    def calculate_amihud(self, returns, volume, window=50):
+        """Amihud Illiquidity Ratio"""
+        illiq = pd.Series(abs(returns) / volume).rolling(window).mean()
+        return illiq
+
+class EnhancedFeatureExtractor:
+    """Advanced feature extraction with sophisticated technical indicators"""
+    
+    def __init__(self, config=None):
+        self.config = config or {}
+        self.window_sizes = self.config.get('window_sizes', [5, 10, 20, 50, 100, 200, 500])
+        self.is_fitted = False
+        self.feature_names = []
+        self.kalman = KalmanFilterFeatures()
+        self.wavelet = WaveletFeatures()
+        self.microstructure = MarketMicrostructureFeatures()
+        self.selected_features = None
+        
+    def _add_basic_price_features(self, df):
+        """Add basic price-based features"""
+        # Initialize Kalman filters if needed
+        if self.kalman.price_kf is None:
+            self.kalman.initialize_filters()
+            
+        # Kalman filtered price and velocity
+        price_states = []
+        price_velocities = []
+        for price in df['close'].values:
+            state, velocity = self.kalman.update(price, self.kalman.price_kf)
+            price_states.append(state)
+            price_velocities.append(velocity)
+        
+        df['price_state'] = price_states
+        df['price_velocity'] = price_velocities
+        
+        # Log returns and volatility
         for window in self.window_sizes:
-            df.ta.sma(length=window, append=True)
-            df.ta.ema(length=window, append=True)
-            sma_col = f'SMA_{window}'; ema_col = f'EMA_{window}'
-            if sma_col in df.columns: df.loc[:, f'price_vs_sma_{window}'] = (df['close'] / df[sma_col]).replace([np.inf, -np.inf], np.nan)
-            if ema_col in df.columns: df.loc[:, f'price_vs_ema_{window}'] = (df['close'] / df[ema_col]).replace([np.inf, -np.inf], np.nan)
-            df.ta.mom(length=window, append=True)
-        if 5 in self.window_sizes and 20 in self.window_sizes:
-             sma5, sma20 = 'SMA_5', 'SMA_20'; ema5, ema20 = 'EMA_5', 'EMA_20'
-             if sma5 in df.columns and sma20 in df.columns: df.loc[:, 'sma_5_20_diff'] = df[sma5] - df[sma20]
-             if ema5 in df.columns and ema20 in df.columns: df.loc[:, 'ema_5_20_diff'] = df[ema5] - df[ema20]
-
-    def _add_volume_features_pta(self, df):
-        df.loc[:, 'log_volume'] = np.log1p(df['volume'])
+            df[f'log_return_{window}'] = np.log(df['close'] / df['close'].shift(window))
+            df[f'volatility_{window}'] = df['log_return_1'].rolling(window).std()
+            
+            # Realized volatility (high-frequency)
+            df[f'realized_vol_{window}'] = np.sqrt(
+                (np.log(df['high'] / df['low'])**2).rolling(window).mean() * 252
+            )
+            
+            # Parkinson volatility estimator
+            df[f'parkinson_vol_{window}'] = np.sqrt(
+                (1 / (4 * np.log(2))) * 
+                (np.log(df['high'] / df['low'])**2).rolling(window).mean() * 252
+            )
+        
+        # Wavelet features
+        close_wavelets = self.wavelet.get_features(df['close'].values)
+        for name, values in close_wavelets.items():
+            df[f'close_{name}'] = values[:len(df)]
+            
+        # Price ratios and patterns
+        df['high_low_ratio'] = df['high'] / df['low']
+        df['close_open_ratio'] = df['close'] / df['open']
+        df['body_size'] = abs(df['close'] - df['open']) / df['open']
+        df['upper_shadow'] = (df['high'] - df[['open', 'close']].max(axis=1)) / df['open']
+        df['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']) / df['open']
+        
+        return df
+        
+    def _add_volume_features(self, df):
+        """Add volume-based features"""
+        # Kalman filtered volume
+        volume_states = []
+        volume_velocities = []
+        for volume in df['tick_volume'].values:
+            state, velocity = self.kalman.update(volume, self.kalman.volume_kf)
+            volume_states.append(state)
+            volume_velocities.append(velocity)
+            
+        df['volume_state'] = volume_states
+        df['volume_velocity'] = volume_velocities
+        
         for window in self.window_sizes:
-            df.ta.sma(close='volume', length=window, prefix='VOL', append=True)
-            vol_sma_col = f'VOL_SMA_{window}'
-            if vol_sma_col in df.columns: df.loc[:, f'volume_vs_sma_{window}'] = (df['volume'] / df[vol_sma_col]).replace([np.inf, -np.inf], np.nan)
-        df.ta.obv(append=True)
-
-    def _add_technical_indicators_pta(self, df):
-        df.ta.rsi(length=14, append=True)
-        df.ta.macd(fast=12, slow=26, signal=9, append=True)
-        df.ta.bbands(length=20, std=2, append=True)
-        df.ta.stoch(k=14, d=3, smooth_k=3, append=True)
-        df.ta.adx(length=14, append=True)
-        df.ta.cci(length=14, append=True)
-        df.ta.willr(length=14, append=True)
-
-    def _add_statistical_features_pta(self, df):
-        log_returns_col = 'LOGRET_1'
-        if log_returns_col not in df.columns: df.ta.log_return(cumulative=False, append=True)
-        if log_returns_col not in df.columns: logger.error("Failed to calculate log returns. Skipping statistical features."); return
-        df[log_returns_col] = pd.to_numeric(df[log_returns_col], errors='coerce').fillna(0)
+            # Volume momentum and trends
+            df[f'volume_sma_{window}'] = df['tick_volume'].rolling(window).mean()
+            df[f'volume_std_{window}'] = df['tick_volume'].rolling(window).std()
+            df[f'volume_momentum_{window}'] = df['tick_volume'] / df[f'volume_sma_{window}']
+            
+            # Volume weighted metrics
+            df[f'vwap_{window}'] = (df['close'] * df['tick_volume']).rolling(window).sum() / df['tick_volume'].rolling(window).sum()
+            df[f'volume_price_trend_{window}'] = ((df['close'] - df['close'].shift(window)) * df['tick_volume']) / df['tick_volume'].rolling(window).sum()
+            
+            # OBV and accumulation/distribution
+            df[f'obv_{window}'] = talib.OBV(df['close'].values, df['tick_volume'].values).rolling(window).mean()
+            df[f'adl_{window}'] = talib.AD(df['high'].values, df['low'].values, df['close'].values, df['tick_volume'].values).rolling(window).mean()
+            
+        # Market microstructure
+        df['vpin'] = self.microstructure.calculate_vpin(df['tick_volume'], df['close'].diff())
+        df['kyle_lambda'] = self.microstructure.calculate_kyle_lambda(df['close'].diff(), df['tick_volume'])
+        df['amihud_ratio'] = self.microstructure.calculate_amihud(df['close'].pct_change(), df['tick_volume'])
+        
+        return df
+        
+    def _add_momentum_indicators(self, df):
+        """Add momentum-based indicators"""
+        # RSI with multiple timeframes
         for window in self.window_sizes:
-            if window <= 1: continue
-            df.ta.stdev(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}")
-            df.ta.skew(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}")
-            df.ta.kurtosis(close=df[log_returns_col], length=window, append=True, suffix=f"_{log_returns_col}")
-            rolling_mean = df[log_returns_col].rolling(window=window).mean()
-            rolling_std = df[log_returns_col].rolling(window=window).std().replace(0, np.nan)
-            df.loc[:, f'roll_zscore_{window}'] = ((df[log_returns_col] - rolling_mean) / rolling_std).fillna(0)
-
-    def _add_volatility_features_pta(self, df):
-        df.ta.atr(length=14, append=True)
-        log_returns = df.get('LOGRET_1', pd.Series(dtype=float)).fillna(0)
-        abs_log_returns = np.abs(log_returns)
+            df[f'rsi_{window}'] = talib.RSI(df['close'].values, timeperiod=window)
+            df[f'rsi_smooth_{window}'] = savgol_filter(
+                df[f'rsi_{window}'].fillna(50), 
+                min(window, 11) if window > 11 else 5, 
+                3
+            )
+            
+        # Enhanced MACD
+        for (fast, slow) in [(12, 26), (5, 35), (8, 21)]:
+            macd, signal, hist = talib.MACD(
+                df['close'].values, 
+                fastperiod=fast, 
+                slowperiod=slow, 
+                signalperiod=9
+            )
+            df[f'macd_{fast}_{slow}'] = macd
+            df[f'macd_signal_{fast}_{slow}'] = signal
+            df[f'macd_hist_{fast}_{slow}'] = hist
+            
+        # Advanced momentum indicators
+        df['cci'] = talib.CCI(df['high'].values, df['low'].values, df['close'].values)
+        df['mfi'] = talib.MFI(df['high'].values, df['low'].values, df['close'].values, df['tick_volume'].values)
+        df['willr'] = talib.WILLR(df['high'].values, df['low'].values, df['close'].values)
+        df['ultosc'] = talib.ULTOSC(df['high'].values, df['low'].values, df['close'].values)
+        
+        return df
+        
+    def _add_volatility_indicators(self, df):
+        """Add volatility-based indicators"""
+        # ATR and variants
         for window in self.window_sizes:
-             if window <= 1: continue
-             df.loc[:, f'abs_ret_ma_{window}'] = abs_log_returns.rolling(window=window).mean()
-             df.loc[:, f'vol_of_vol_{window}'] = abs_log_returns.rolling(window=window).std().fillna(0)
-
-    def _add_trend_features_pta(self, df):
-        df.ta.aroon(length=14, append=True)
-
-    def _add_seasonality_features(self, df):
-        if isinstance(df.index, pd.DatetimeIndex):
-            df.loc[:, 'hour'] = df.index.hour
-            df.loc[:, 'day_of_week'] = df.index.dayofweek
-            df.loc[:, 'hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
-            df.loc[:, 'hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-            df.loc[:, 'day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-            df.loc[:, 'day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
-        else: logger.warning("DataFrame index is not DatetimeIndex, cannot add seasonality features.")
-
-    # --- New Method for Donchian Channel ---
-    def _add_donchian_channel_pta(self, df):
-        """Adds Donchian Channel features using pandas-ta."""
-        # Use lengths defined in __init__
-        lower_len = self.donchian_lower_length
-        upper_len = self.donchian_upper_length
-        df.ta.donchian(lower_length=lower_len, upper_length=upper_len, append=True)
-        # Resulting columns are typically named DCL_lower_upper, DCM_lower_upper, DCU_lower_upper
-        # Example: DCL_240_480, DCM_240_480, DCU_240_480
-
-        # Optional: Add feature for price position within the channel
-        lower_col = f'DCL_{lower_len}_{upper_len}'
-        upper_col = f'DCU_{lower_len}_{upper_len}'
-        if lower_col in df.columns and upper_col in df.columns:
-             channel_range = (df[upper_col] - df[lower_col]).replace(0, np.nan) # Avoid division by zero
-             df.loc[:, f'donchian_pos_{lower_len}_{upper_len}'] = ((df['close'] - df[lower_col]) / channel_range).fillna(0.5) # Fill NaNs with mid-point (0.5)
-
-    # --- Update methods remain the same ---
-    def update_tick(self, tick_data): self.tick_buffer.append(tick_data)
-    def update_order_book(self, order_book): self.order_book_buffer.append(order_book)
+            df[f'atr_{window}'] = talib.ATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=window)
+            df[f'natr_{window}'] = talib.NATR(df['high'].values, df['low'].values, df['close'].values, timeperiod=window)
+            
+            # Normalized ATR
+            df[f'natr_percentile_{window}'] = (
+                df[f'natr_{window}'].rolling(window).apply(
+                    lambda x: stats.percentileofscore(x.dropna(), x.iloc[-1])
+                )
+            )
+            
+        # Enhanced Bollinger Bands
+        for window in [20, 50, 100]:
+            upper, middle, lower = talib.BBANDS(
+                df['close'].values, 
+                timeperiod=window,
+                nbdevup=2,
+                nbdevdn=2,
+                matype=0
+            )
+            df[f'bb_upper_{window}'] = upper
+            df[f'bb_middle_{window}'] = middle
+            df[f'bb_lower_{window}'] = lower
+            df[f'bb_width_{window}'] = (upper - lower) / middle
+            
+            # BB percentile
+            df[f'bb_percentile_{window}'] = (df['close'] - lower) / (upper - lower)
+            
+        # Volatility regime detection
+        df['high_low_range'] = (df['high'] - df['low']) / df['close']
+        df['volatility_regime'] = pd.qcut(
+            df['high_low_range'].rolling(100).std(),
+            q=5,
+            labels=['very_low', 'low', 'medium', 'high', 'very_high']
+        ).astype(str)
+        
+        return df
+        
+    def _add_trend_indicators(self, df):
+        """Add trend-based indicators"""
+        # Multiple EMAs and variants
+        for window in self.window_sizes:
+            df[f'ema_{window}'] = talib.EMA(df['close'].values, timeperiod=window)
+            df[f'tema_{window}'] = talib.TEMA(df['close'].values, timeperiod=window)
+            df[f'dema_{window}'] = talib.DEMA(df['close'].values, timeperiod=window)
+            
+            # Trend strength
+            df[f'trend_strength_{window}'] = abs(
+                df[f'ema_{window}'] - df[f'ema_{window}'].shift(window)
+            ) / df[f'atr_{window}']
+            
+        # Enhanced Ichimoku Cloud
+        df['tenkan_sen'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
+        df['kijun_sen'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
+        df['senkou_span_a'] = ((df['tenkan_sen'] + df['kijun_sen']) / 2).shift(26)
+        df['senkou_span_b'] = ((df['high'].rolling(52).max() + df['low'].rolling(52).min()) / 2).shift(26)
+        df['chikou_span'] = df['close'].shift(-26)
+        
+        # Cloud strength
+        df['cloud_strength'] = df['senkou_span_a'] - df['senkou_span_b']
+        
+        # Trend detection
+        df['supertrend'] = talib.HT_TRENDLINE(df['close'].values)
+        df['trend_direction'] = np.sign(df['close'] - df['supertrend'])
+        
+        return df
+        
+    def _add_market_microstructure(self, df):
+        """Add market microstructure features"""
+        # Order flow imbalance
+        df['trade_imbalance'] = df['tick_volume'] * np.sign(df['close'] - df['open'])
+        df['cum_imbalance'] = df['trade_imbalance'].cumsum()
+        
+        # Liquidity measures
+        df['spread_proxy'] = (df['high'] - df['low']) / df['close']
+        df['effective_spread'] = abs(df['close'] - df['vwap_20']) / df['vwap_20']
+        
+        # Order flow toxicity
+        df['flow_toxicity'] = self.microstructure.calculate_vpin(
+            df['tick_volume'],
+            df['close'].diff(),
+            window=50
+        )
+        
+        # Market impact
+        df['price_impact'] = self.microstructure.calculate_kyle_lambda(
+            df['close'].diff(),
+            df['tick_volume'],
+            window=50
+        )
+        
+        # Liquidity risk
+        df['illiquidity'] = self.microstructure.calculate_amihud(
+            df['close'].pct_change(),
+            df['tick_volume'],
+            window=50
+        )
+        
+        return df
+        
+    def _add_regime_features(self, df):
+        """Add market regime detection features"""
+        # Trend strength and persistence
+        df['adx'] = talib.ADX(df['high'].values, df['low'].values, df['close'].values)
+        df['trend_strength'] = pd.qcut(
+            df['adx'],
+            q=5,
+            labels=['very_weak', 'weak', 'moderate', 'strong', 'very_strong']
+        ).astype(str)
+        
+        # Volatility regime
+        for window in [20, 50, 100]:
+            vol = df['close'].pct_change().rolling(window).std() * np.sqrt(252)
+            df[f'volatility_regime_{window}'] = pd.qcut(
+                vol,
+                q=5,
+                labels=['very_low', 'low', 'medium', 'high', 'very_high']
+            ).astype(str)
+        
+        # Volume regime
+        for window in [20, 50, 100]:
+            vol_z_score = (
+                (df['tick_volume'] - df['tick_volume'].rolling(window).mean()) /
+                df['tick_volume'].rolling(window).std()
+            )
+            df[f'volume_regime_{window}'] = pd.qcut(
+                vol_z_score,
+                q=5,
+                labels=['very_low', 'low', 'medium', 'high', 'very_high']
+            ).astype(str)
+            
+        # Market efficiency ratio
+        for window in [20, 50, 100]:
+            df[f'efficiency_ratio_{window}'] = abs(
+                df['close'] - df['close'].shift(window)
+            ) / (df['high'] - df['low']).rolling(window).sum()
+            
+        return df
+        
+    def _select_features(self, df, top_k=None):
+        """Select most informative features using mutual information"""
+        if top_k is None:
+            return df
+            
+        # Calculate returns (target variable for feature selection)
+        returns = df['close'].pct_change().shift(-1)  # Forward returns
+        
+        # Calculate mutual information scores
+        mi_scores = mutual_info_regression(
+            df.select_dtypes(include=[np.number]).fillna(0),
+            returns.fillna(0)
+        )
+        
+        # Get top features
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        scores = pd.Series(mi_scores, index=numeric_cols)
+        selected_features = scores.nlargest(top_k).index.tolist()
+        
+        # Add back non-numeric columns
+        final_features = selected_features + df.select_dtypes(exclude=[np.number]).columns.tolist()
+        
+        return df[final_features]
+        
+    def fit(self, df):
+        """Fit the feature extractor"""
+        features = self._extract_all_features(df)
+        
+        # Feature selection if configured
+        if self.config.get('feature_selection', {}).get('method') == 'mutual_info':
+            top_k = self.config.get('feature_selection', {}).get('top_k', None)
+            if top_k:
+                features = self._select_features(features, top_k)
+                self.selected_features = features.columns.tolist()
+        
+        self.feature_names = features.columns.tolist()
+        self.is_fitted = True
+        return self
+        
+    def _extract_all_features(self, df):
+        """Extract all features"""
+        df = df.copy()
+        
+        # Add basic return
+        df['log_return_1'] = np.log(df['close'] / df['close'].shift(1))
+        
+        # Add all feature groups
+        df = self._add_basic_price_features(df)
+        df = self._add_volume_features(df)
+        df = self._add_momentum_indicators(df)
+        df = self._add_volatility_indicators(df)
+        df = self._add_trend_indicators(df)
+        df = self._add_market_microstructure(df)
+        df = self._add_regime_features(df)
+        
+        # Drop rows with NaN values from lookback windows
+        df = df.dropna()
+        
+        return df
+        
+    def transform(self, df):
+        """Transform the data by extracting features"""
+        if not self.is_fitted:
+            raise ValueError("FeatureExtractor must be fitted before transform")
+            
+        features = self._extract_all_features(df)
+        
+        # Apply feature selection if fitted with it
+        if self.selected_features is not None:
+            features = features[self.selected_features]
+            
+        return features
+        
+    def fit_transform(self, df):
+        """Fit and transform the data"""
+        self.fit(df)
+        return self.transform(df)
 
 
 class FeaturePipeline:
-    """
-    Manages the overall feature engineering process using the pandas-ta based extractor.
-    Handles scaler persistence.
-    """
+    """Complete feature engineering pipeline with advanced scaling"""
+    
     def __init__(self, config=None):
         self.config = config or {}
-        self.feature_extractor = FeatureExtractor(self.config.get('feature_config', self.config)) # Pass config down
-        self.selected_features = []
-
-    def fit(self, market_data, target=None):
-        """Fits the feature extractor's scaler."""
-        self.feature_extractor.fit(market_data)
-        self.selected_features = self.feature_extractor.feature_names
+        self.feature_extractor = EnhancedFeatureExtractor(config)
+        
+        # Use robust quantile scaling if configured
+        if self.config.get('normalization', {}).get('type') == 'robust_quantile':
+            q_range = self.config.get('normalization', {}).get('quantile_range', [0.001, 0.999])
+            self.scaler = RobustScaler(quantile_range=q_range)
+        else:
+            self.scaler = RobustScaler()
+            
+        self.is_fitted = False
+        
+    def fit(self, df):
+        """Fit the pipeline"""
+        features = self.feature_extractor.fit_transform(df)
+        self.scaler.fit(features.select_dtypes(include=[np.number]))
+        self.is_fitted = True
         return self
+        
+    def transform(self, df):
+        """Transform using the pipeline"""
+        if not self.is_fitted:
+            raise ValueError("Pipeline must be fitted before transform")
+            
+        features = self.feature_extractor.transform(df)
+        
+        # Scale only numeric features
+        numeric_features = features.select_dtypes(include=[np.number])
+        categorical_features = features.select_dtypes(exclude=[np.number])
+        
+        scaled_numeric = pd.DataFrame(
+            self.scaler.transform(numeric_features),
+            index=numeric_features.index,
+            columns=numeric_features.columns
+        )
+        
+        # Combine scaled numeric with categorical
+        if not categorical_features.empty:
+            scaled_features = pd.concat([scaled_numeric, categorical_features], axis=1)
+        else:
+            scaled_features = scaled_numeric
+            
+        return scaled_features
+        
+    def fit_transform(self, df):
+        """Fit and transform the data"""
+        self.fit(df)
+        return self.transform(df)
+        
+    def save(self, path):
+        """Save the pipeline to disk"""
+        dump(self, path)
+        
+    @classmethod
+    def load(cls, path):
+        """Load the pipeline from disk"""
+        return load(path)
 
-    def transform(self, raw_features_data):
-        """Transforms pre-calculated raw features using the fitted feature extractor."""
-        return self.feature_extractor.transform(raw_features_data)
 
-    def save_scaler(self, path):
-        """Saves the fitted scaler state via the FeatureExtractor."""
-        return self.feature_extractor.save_scaler(path)
-
-    def load_scaler(self, path):
-        """Loads the scaler state via the FeatureExtractor."""
-        self.feature_extractor.load_scaler(path)
-        if self.feature_extractor.is_fitted:
-             self.selected_features = self.feature_extractor.feature_names
-
-    def update_tick(self, tick_data): self.feature_extractor.update_tick(tick_data)
-    def update_order_book(self, order_book): self.feature_extractor.update_order_book(order_book)
-
-
-# --- Factory Function ---
-def create_feature_pipeline(config):
-    """Factory function to create the FeaturePipeline."""
-    feature_config = config.get('feature_config', {}) # Get feature_config section
-    return FeaturePipeline(config=feature_config) # Pass it to the pipeline
+def create_feature_pipeline(config=None):
+    """Factory function to create feature pipeline"""
+    return FeaturePipeline(config)

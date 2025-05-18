@@ -84,62 +84,163 @@ notifications:
 
 # --- Data Configuration (data_config) ---
 data_config:
-  source: 'mt5' # Keep as 'mt5' for using the broker interface
-  timeframe: 'M1' # Timeframe for historical data/features
-  num_bars: 50000 # Number of historical bars to load for training/simulation start
+  source: 'mt5'
+  timeframe: 'M1'
+  num_bars: 100000  # Increased from 50000 for better historical context
+  validation_split: 0.2
+  test_split: 0.1
 
 # --- Feature Engineering Configuration (feature_config) ---
 feature_config:
-  window_sizes: [5, 10, 20, 50, 100, 200]
-  donchian_lower: 240 # ~4 hours on M1
-  donchian_upper: 480 # ~8 hours on M1
+  window_sizes: [5, 10, 20, 50, 100, 200, 500]
+  volatility_windows: [20, 50, 100, 200]
+  momentum_windows: [14, 28, 56, 112]
+  trend_windows: [9, 26, 52, 104]
+  volume_windows: [20, 50, 100, 200]
+  regime_windows: [20, 50, 100, 200]
+  use_ta_lib: true
+  use_wavelets: true  # Wavelet decomposition
+  use_kalman: true   # Kalman filtering
+  feature_selection:
+    method: 'mutual_info'  # Mutual information-based selection
+    top_k: 512  # Keep top 512 features
+  normalization:
+    type: 'robust_quantile'  # Better than standard scaling
+    quantile_range: [0.001, 0.999]
 
 # --- Model Configuration (model_config) ---
 model_config:
-  load_path_base: 'results/' # Where to load existing models from
-  save_path_base: 'results/' # Where to save trained models
-  num_features: 116 # *** Ensure this matches output of features.py ***
-  seq_length: 201 # Input sequence length for the model
-  hidden_size: 128
-  num_layers: 2
-  tcn_channels: [64, 128, 128]
-  tcn_kernel_size: 3
-  num_heads: 4
-  num_transformer_layers: 2
-  dropout: 0.2
+  load_path_base: 'results/'
+  save_path_base: 'results/'
+  num_features: 512  # Increased for richer feature representation
+  seq_length: 201
+  hidden_size: 768   # Increased from 512
+  num_layers: 8      # Increased from 6
+  num_heads: 32      # Increased from 16
+  dropout: 0.1       # Reduced dropout for better memorization
+  sparsity: 0.95     # Increased sparsity for better focus
+  quantiles: [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99]  # More granular distribution modeling
+  kernel_sizes: [3, 7, 15, 31, 63]  # Extended multi-scale pattern detection
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  use_amp: true     # Automatic mixed precision
+  ema_decay: 0.999  # Exponential moving average of weights
+  use_regime_detection: true
+  use_neural_flow: true
+  use_hierarchical_attention: true
+
+# --- Training Configuration (training_config) ---
+training_config:
+  batch_size: 128
+  accumulation_steps: 4  # Effective batch size of 512
+  num_epochs: 200
+  early_stopping_patience: 20
+  learning_rate_scheduler:
+    type: 'one_cycle'  # Better than cosine for HFT
+    max_lr: 0.001
+    pct_start: 0.3
+    div_factor: 25.0
+    final_div_factor: 1000.0
+  warmup_steps: 2000
+  mixed_precision: true
+  gradient_checkpointing: true  # Memory efficiency
+  loss_config:
+    value_loss_weight: 1.0
+    policy_loss_weight: 1.0
+    entropy_weight: 0.01
+    quantile_loss_weight: 1.0
+    regime_loss_weight: 0.5
+    uncertainty_loss_weight: 0.5
 
 # --- Strategy Configuration (strategy_config) ---
 strategy_config:
-  agent_config: # PPO Agent hyperparameters
+  agent_config:
     learning_rate: 0.0001
-    gamma: 0.99 # Discount factor for future rewards
-    lambda_gae: 0.95 # Generalized Advantage Estimation lambda
-    ppo_epsilon: 0.2 # PPO clipping parameter
-    ppo_epochs: 8 # Number of optimization epochs per PPO update
-    batch_size: 64
-    entropy_coef: 0.02 # Exploration bonus coefficient
-    value_loss_coef: 0.5 # Coefficient for the value function loss
-    catastrophic_memory_size: 20 # Memory for repeated bad trades
-
-  reward_config: # Simplified reward structure from original file
-    pnl_scale: 100.0
-    profit_bonus_factor: 1.5
-    loss_penalty_factor: 1.5
-    max_loss_penalty: -10.0
-    holding_penalty_factor: 0.0
-    profit_capture_bonus: 1.0
-    transaction_cost_penalty: -0.05
-    uncertainty_penalty_factor: 0.0
-    high_volatility_penalty_factor: 0.0
-    trend_follow_bonus: 0.0
-    mean_revert_bonus: 0.0
-    trend_against_penalty: 0.0
-    mean_revert_against_penalty: 0.0
-    uncertain_regime_penalty: 0.0
-    quick_profit_bonus_factor: 0.0
-    sharpe_ratio_bonus_factor: 0.0
-    catastrophic_threshold: -20.0
-    catastrophic_repeat_penalty: -5.0
+    gamma: 0.99
+    lambda_gae: 0.95
+    ppo_epsilon: 0.2
+    ppo_epochs: 12  # Increased from 8
+    batch_size: 256 # Increased from 128
+    entropy_coef: 0.01
+    value_loss_coef: 0.5
+    max_grad_norm: 0.5
+    advantage_normalization: true
+    reward_scaling: true
+    use_gae: true
+    
+  risk_management:
+    max_position_size: 0.5  # Reduced from 1.0 for better risk control
+    max_leverage: 20       # Reduced from 30
+    max_drawdown: 0.015    # Reduced from 0.02
+    position_sizing_method: 'adaptive_kelly'  # Enhanced position sizing
+    risk_per_trade: 0.005  # Reduced from 0.01
+    use_dynamic_stops: true
+    trailing_stop: true
+    stop_loss_atr_multiplier: 2.5
+    take_profit_atr_multiplier: 5.0
+    max_correlation: 0.7   # New: limit correlated positions
+    var_limit: 0.02       # New: Value at Risk limit
+    es_limit: 0.03        # New: Expected Shortfall limit
+    max_positions_per_regime: 3  # New: regime-based position limits
+    adaptive_timeframe: true    # New: adapt to market conditions
+    
+  execution:
+    use_limit_orders: true
+    slippage_model: 'adaptive_ml'  # Enhanced slippage modeling
+    transaction_costs: true
+    min_trade_interval: 10   # Increased from 5
+    max_positions_per_symbol: 2
+    use_iceberg_orders: true
+    order_execution_timeout: 45  # Increased from 30
+    smart_order_routing: true   # New: intelligent order routing
+    liquidity_threshold: 0.8    # New: minimum required liquidity
+    
+  filters:
+    min_volatility: 0.0001
+    max_spread: 0.0002    # Reduced from 0.0003
+    min_volume: 200       # Increased from 100
+    trend_filter: true
+    volatility_filter: true
+    regime_filter: true
+    liquidity_filter: true
+    correlation_filter: true    # New
+    market_impact_filter: true  # New
+    regime_transition_filter: true  # New
+    
+  monitoring:
+    log_level: 'INFO'
+    save_trades: true
+    performance_metrics: [
+      'sharpe', 'sortino', 'calmar', 'omega',
+      'max_drawdown', 'win_rate', 'profit_factor',
+      'expectancy', 'tail_ratio', 'var_95', 'cvar_95',
+      'regime_accuracy', 'position_quality',  # New metrics
+      'execution_efficiency', 'risk_adjusted_return',
+      'regime_transition_score', 'adaptive_sharpe'
+    ]
+    risk_metrics: [
+      'var', 'cvar', 'omega_ratio',
+      'sortino_ratio', 'tail_ratio',
+      'max_drawdown_duration', 'ulcer_index',
+      'conditional_drawdown', 'extreme_deviation',  # New metrics
+      'correlation_risk', 'concentration_risk',
+      'regime_risk', 'liquidity_risk'
+    ]
+    regime_metrics: [
+      'trend_strength', 'volatility_regime',
+      'liquidity_score', 'market_impact',
+      'regime_stability', 'regime_transition',  # New metrics
+      'market_efficiency', 'market_quality',
+      'microstructure_score', 'adaptive_regime'
+    ]
+    alert_thresholds:  # New: Advanced alerting system
+      drawdown_alert: 0.01
+      var_breach: 0.015
+      correlation_warning: 0.65
+      regime_change_alert: true
+      liquidity_warning: 0.7
+      execution_quality_alert: 0.8
 
 # --- Portfolio Capital Management Configuration (portfolio_capital_config) ---
 portfolio_capital_config:

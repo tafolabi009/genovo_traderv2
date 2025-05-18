@@ -77,24 +77,89 @@ class GenovoTraderService(win32serviceutil.ServiceFramework):
         service_dir = Path(__file__).resolve().parent
         bot_script = service_dir / "main.py"
         
+        # Create log file for bot output
+        bot_log = Path("C:/ProgramData/GenovoTraderV2/logs/bot_output.log")
+        
+        # Set up environment variables
+        env = os.environ.copy()
+        env['PYTHONPATH'] = str(service_dir)  # Add service directory to Python path
+        
+        # Get the regular Python executable path instead of pythonservice.exe
+        python_exe = Path(sys.executable).parent / "python.exe"
+        if not python_exe.exists():
+            python_exe = Path(sys.executable).parent / "python3.exe"
+        if not python_exe.exists():
+            logging.error("Could not find Python executable")
+            return
+            
+        logging.info(f"Using Python executable: {python_exe}")
+        
+        # First, test if Python and imports are working
+        logging.info("Testing Python environment...")
+        try:
+            test_cmd = [
+                str(python_exe),
+                "-c",
+                "import sys; print('Python path:', sys.path); import yaml, pandas, numpy, torch, MetaTrader5; print('All imports successful')"
+            ]
+            test_process = subprocess.run(
+                test_cmd,
+                env=env,
+                cwd=str(service_dir),
+                capture_output=True,
+                text=True
+            )
+            logging.info(f"Test output: {test_process.stdout}")
+            if test_process.stderr:
+                logging.error(f"Test errors: {test_process.stderr}")
+        except Exception as e:
+            logging.error(f"Environment test failed: {e}")
+        
         while self.running:
             try:
                 # Kill any existing MetaTrader processes
                 self.cleanup_mt5_processes()
                 
-                # Start the bot process
+                # Start the bot process with output redirection
                 logging.info("Starting bot process...")
-                self.process = subprocess.Popen(
-                    [sys.executable, str(bot_script), "--mode", "live"],
+                with open(bot_log, 'a') as f:
+                    f.write(f"\n{'='*50}\n")
+                    f.write(f"Starting bot at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Working directory: {service_dir}\n")
+                    f.write(f"Python executable: {python_exe}\n")
+                    f.write(f"PYTHONPATH: {env.get('PYTHONPATH', 'Not set')}\n")
+                    f.write(f"{'='*50}\n")
+                
+                # First try to run with -v to see import errors
+                debug_process = subprocess.run(
+                    [str(python_exe), "-v", str(bot_script), "--mode", "live"],
                     cwd=str(service_dir),
+                    env=env,
+                    capture_output=True,
+                    text=True
+                )
+                with open(bot_log, 'a') as f:
+                    f.write("\nDebug Output:\n")
+                    f.write(debug_process.stdout)
+                    f.write("\nDebug Errors:\n")
+                    f.write(debug_process.stderr)
+                
+                # Now run the actual bot process
+                self.process = subprocess.Popen(
+                    [str(python_exe), str(bot_script), "--mode", "live"],
+                    cwd=str(service_dir),
+                    env=env,
+                    stdout=open(bot_log, 'a'),
+                    stderr=subprocess.STDOUT,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 )
                 
-                # Log successful start to Windows Event Log
+                # Log successful start
+                logging.info(f"Bot process started with PID: {self.process.pid}")
                 servicemanager.LogMsg(
                     servicemanager.EVENTLOG_INFORMATION_TYPE,
-                    0xF001,  # Custom event ID
-                    ("Bot process started successfully",)
+                    0xF001,
+                    (f"Bot process started with PID: {self.process.pid}",)
                 )
                 
                 # Monitor the process
@@ -102,12 +167,23 @@ class GenovoTraderService(win32serviceutil.ServiceFramework):
                     if self.process.poll() is not None:
                         # Process has terminated
                         exit_code = self.process.returncode
-                        logging.warning(f"Bot process terminated with exit code: {exit_code}")
-                        # Log termination to Windows Event Log
+                        error_msg = f"Bot process terminated with exit code: {exit_code}"
+                        logging.warning(error_msg)
+                        
+                        # Try to get the last few lines of the bot log
+                        try:
+                            with open(bot_log, 'r') as f:
+                                # Read last 10 lines
+                                lines = f.readlines()[-10:]
+                                error_context = ''.join(lines)
+                                logging.warning(f"Last bot output:\n{error_context}")
+                        except Exception as e:
+                            logging.error(f"Could not read bot log: {e}")
+                        
                         servicemanager.LogMsg(
                             servicemanager.EVENTLOG_WARNING_TYPE,
-                            0xF002,  # Custom event ID
-                            (f"Bot process terminated with exit code: {exit_code}",)
+                            0xF002,
+                            (error_msg,)
                         )
                         break
                     
@@ -125,10 +201,9 @@ class GenovoTraderService(win32serviceutil.ServiceFramework):
                 
             except Exception as e:
                 logging.error(f"Error in main service loop: {e}")
-                # Log error to Windows Event Log
                 servicemanager.LogMsg(
                     servicemanager.EVENTLOG_ERROR_TYPE,
-                    0xF003,  # Custom event ID
+                    0xF003,
                     (f"Error in main service loop: {str(e)}",)
                 )
                 if self.running:
@@ -137,16 +212,31 @@ class GenovoTraderService(win32serviceutil.ServiceFramework):
     def cleanup_mt5_processes(self):
         """Kill any existing MetaTrader 5 processes"""
         try:
+            mt5_killed = False
             for proc in psutil.process_iter(['pid', 'name']):
-                if proc.info['name'] == 'terminal64.exe':
-                    try:
-                        psutil.Process(proc.info['pid']).terminate()
-                        logging.info(f"Terminated MT5 process (PID: {proc.info['pid']})")
-                    except Exception as e:
-                        logging.error(f"Error terminating MT5 process: {e}")
-            time.sleep(5)  # Give processes time to terminate
+                try:
+                    if proc.info['name'].lower() in ['terminal64.exe', 'metatrader5.exe', 'mt5terminal.exe']:
+                        proc_obj = psutil.Process(proc.info['pid'])
+                        # Try graceful termination first
+                        proc_obj.terminate()
+                        try:
+                            proc_obj.wait(timeout=10)
+                        except psutil.TimeoutExpired:
+                            proc_obj.kill()  # Force kill if graceful termination fails
+                        mt5_killed = True
+                        logging.info(f"Terminated MT5 process: {proc.info['name']} (PID: {proc.info['pid']})")
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                
+            if mt5_killed:
+                # Give extra time for MT5 to fully cleanup if we killed any instances
+                time.sleep(10)
+            else:
+                logging.info("No MT5 processes found to cleanup")
+                
         except Exception as e:
             logging.error(f"Error during MT5 process cleanup: {e}")
+            # Continue anyway - not critical if cleanup fails
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:

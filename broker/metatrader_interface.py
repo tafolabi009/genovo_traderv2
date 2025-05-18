@@ -66,46 +66,49 @@ class MetatraderInterface:
             os.environ['MT5_TIMEOUT'] = '300000'  # 5 minutes
             os.environ['MT5_CONNECT_TIMEOUT'] = '300000'  # 5 minutes
             
-            if not mt5.initialize(
-                login=self.login_params["login"],
-                password=self.login_params["password"],
-                server=self.login_params["server"],
-                path=self.login_params["path"], # path to terminal.exe
-                timeout=300000  # 5 minute timeout
-            ):
-                error_code = mt5.last_error()
-                logger.error(f"MT5 connection failed: Error {error_code}")
+            # Initialize MT5
+            init_result = mt5.initialize(
+                path=self.login_params['path'],
+                login=self.login_params['login'],
+                password=self.login_params['password'],
+                server=self.login_params['server'],
+                timeout=30000
+            )
+            
+            # Check if MT5 is actually initialized
+            if not init_result or not mt5.terminal_info():
+                logger.error("MT5 initialization failed or terminal not responding")
                 mt5.shutdown()
-                raise ConnectionError(f"MT5 Initialization failed with code {error_code}")
-
-            terminal_info = mt5.terminal_info()
-            if not terminal_info:
-                logger.error("MT5 connection failed: Could not get terminal info.")
+                time.sleep(5)
+                raise ConnectionError("MT5 initialization failed")
+                
+            # Verify we can actually interact with MT5
+            account_info = mt5.account_info()
+            if not account_info:
+                logger.error("MT5 initialized but cannot get account info")
                 mt5.shutdown()
-                raise ConnectionError("MT5 connected but could not get terminal info.")
-
-            if not terminal_info.connected:
-                 logger.error("MT5 Initialization successful but not connected to trade server.")
-                 mt5.shutdown()
-                 raise ConnectionError("MT5 not connected to trade server.")
-
-
-            logger.info(f"MT5 Connection successful: Terminal Version {mt5.version()}, Broker: {terminal_info.name}")
+                time.sleep(5)
+                raise ConnectionError("MT5 connection test failed")
+                
+            logger.info(f"Successfully connected to MT5 account: {account_info.login} ({account_info.server})")
             self.connected = True
-            self.account_info = self.get_account_info()
-            if self.account_info:
-                 self.account_currency = self.account_info.currency
-                 logger.info(f"Account Info: Currency={self.account_currency}, Balance={self.account_info.balance:.2f}, Equity={self.account_info.equity:.2f}")
+            self.account_info = account_info
+            if account_info:
+                 self.account_currency = account_info.currency
+                 logger.info(f"Account Info: Currency={self.account_currency}, Balance={account_info.balance:.2f}, Equity={account_info.equity:.2f}")
             else:
                  logger.error("Failed to retrieve account info after connection.")
                  self.disconnect()
                  raise ConnectionError("MT5 connected but failed to get account info.")
 
+            return True
+            
         except Exception as e:
-            logger.exception(f"An unexpected error occurred during MT5 connection: {e}")
-            self.connected = False
-            mt5.shutdown() # Ensure shutdown on unexpected error
-            raise ConnectionError(f"MT5 connection process failed: {e}")
+            logger.error(f"Error connecting to MT5: {str(e)}")
+            if mt5.initialize():  # If somehow still initialized
+                mt5.shutdown()
+            time.sleep(5)
+            raise ConnectionError(f"Failed to connect to MT5: {str(e)}")
 
     def disconnect(self):
         """Shuts down the connection to MetaTrader 5."""
