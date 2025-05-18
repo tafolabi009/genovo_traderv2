@@ -52,16 +52,26 @@ class MetatraderInterface:
         self.account_currency = None
         self.account_info = None
 
-    @retry(stop=stop_after_attempt(5), wait=wait_fixed(5), retry=retry_if_exception_type(ConnectionError))
+    @retry(stop=stop_after_attempt(5), wait=wait_fixed(10), retry=retry_if_exception_type(ConnectionError))
     def connect(self):
         """Establishes connection to MetaTrader 5 terminal."""
         logger.info(f"Attempting to connect to MetaTrader 5: Server='{self.login_params['server']}', Login='{self.login_params['login']}'")
         try:
+            # Ensure MT5 is shutdown before attempting connection
+            mt5.shutdown()
+            time.sleep(5)  # Give time for cleanup
+            
+            # Set timeout values directly before initialization
+            os.environ['MT5IPC_TIMEOUT'] = '300000'  # 5 minutes
+            os.environ['MT5_TIMEOUT'] = '300000'  # 5 minutes
+            os.environ['MT5_CONNECT_TIMEOUT'] = '300000'  # 5 minutes
+            
             if not mt5.initialize(
                 login=self.login_params["login"],
                 password=self.login_params["password"],
                 server=self.login_params["server"],
-                path=self.login_params["path"] # path to terminal.exe
+                path=self.login_params["path"], # path to terminal.exe
+                timeout=300000  # 5 minute timeout
             ):
                 error_code = mt5.last_error()
                 logger.error(f"MT5 connection failed: Error {error_code}")

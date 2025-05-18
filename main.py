@@ -97,7 +97,7 @@ def initialize_mt5_connection(config, logger):
         logger.info("Starting MetaTrader 5 with administrator privileges...")
         try:
             # Using runas to elevate privileges
-            subprocess.Popen(['powershell', 'Start-Process', '-FilePath', path, 
+            subprocess.Popen(['powershell', 'Start-Process', '-FilePath', f'"{path}"', 
                             '-ArgumentList', '/portable', '-Verb', 'runas'])
             
             logger.info("Waiting 30 seconds for MetaTrader 5 terminal to start with admin privileges...")
